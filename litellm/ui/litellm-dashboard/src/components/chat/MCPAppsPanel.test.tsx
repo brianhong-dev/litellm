@@ -121,6 +121,69 @@ describe("MCPAppsPanel connected-app reachability (LIT-4861)", () => {
     vi.clearAllMocks();
   });
 
+  it("reports the id of each server it shows as connected in connect mode", async () => {
+    vi.mocked(fetchMCPServers).mockResolvedValue([
+      ...connectServers,
+      { server_id: "s-twin", server_name: "reachable_srv", auth_type: "true_passthrough" },
+    ] as MCPServer[]);
+    vi.mocked(listMCPTools).mockResolvedValue({ tools: [] });
+    const onConnectedServerIds = vi.fn();
+
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <MCPAppsPanel
+          accessToken="tok"
+          selectedServers={["reachable_srv", "unreachable_srv", "deleted_srv"]}
+          onChange={vi.fn()}
+          connectMode
+          onConnectedServerIds={onConnectedServerIds}
+        />
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => expect(onConnectedServerIds).toHaveBeenCalled());
+    expect(onConnectedServerIds).toHaveBeenLastCalledWith(["s-reach"]);
+  });
+
+  it("reports nothing while the list is still loading", async () => {
+    vi.mocked(fetchMCPServers).mockReturnValue(new Promise(() => {}));
+    const onConnectedServerIds = vi.fn();
+
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <MCPAppsPanel
+          accessToken="tok"
+          selectedServers={["alpha"]}
+          onChange={vi.fn()}
+          connectMode
+          onConnectedServerIds={onConnectedServerIds}
+        />
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => expect(fetchMCPServers).toHaveBeenCalled());
+    expect(onConnectedServerIds).not.toHaveBeenCalled();
+  });
+
+  it("reports no servers when the list fails to load in connect mode", async () => {
+    vi.mocked(fetchMCPServers).mockRejectedValue(new Error("list failed"));
+    const onConnectedServerIds = vi.fn();
+
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <MCPAppsPanel
+          accessToken="tok"
+          selectedServers={["alpha"]}
+          onChange={vi.fn()}
+          connectMode
+          onConnectedServerIds={onConnectedServerIds}
+        />
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => expect(onConnectedServerIds).toHaveBeenCalledWith([]));
+  });
+
   it("requests the connected-app view and hides unreachable servers in connect mode", async () => {
     vi.mocked(fetchMCPServers).mockResolvedValue(connectServers);
     vi.mocked(listMCPTools).mockResolvedValue({ tools: [] });

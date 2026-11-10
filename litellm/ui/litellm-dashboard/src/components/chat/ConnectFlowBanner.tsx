@@ -8,12 +8,17 @@ import { getProxyBaseUrl, ConnectFlowStatus } from "@/components/networking";
 import { OAuth2ConnectButton } from "@/components/chat/MCPAppsPanel";
 import i18n from "@/i18n/i18n";
 
+// More would pass the gateway's form field limit; posting none keeps the unscoped grant.
+const MAX_POSTED_PICKS = 997;
+
 interface Props {
   flowHandle: string;
   flow?: ConnectFlowStatus;
   accessToken: string;
   onConnected: () => void;
   failed: boolean;
+  /** null until the page has loaded its servers. */
+  connectedServerIds?: string[] | null;
 }
 
 /** Finish remains an explicit POST because a cross-site navigation must never mint a code. */
@@ -89,11 +94,20 @@ const vendorServersFor = (
   return [{ server_id: flow.server_id, server_name: flow.server_name }];
 };
 
-const ConnectFlowBanner: React.FC<Props> = ({ flowHandle, flow, accessToken, onConnected, failed }) => {
+const ConnectFlowBanner: React.FC<Props> = ({
+  flowHandle,
+  flow,
+  accessToken,
+  onConnected,
+  failed,
+  connectedServerIds = [],
+}) => {
   const { t } = useTranslation();
   const action = `${getProxyBaseUrl()}/authorize/complete`;
   const state = failed || flow === undefined ? "stale" : flow.state;
   const canFinish = canFinishConnectFlow(state, flow);
+  const fitsTheForm = connectedServerIds !== null && connectedServerIds.length <= MAX_POSTED_PICKS;
+  const postedServerIds = state === "unscoped" && fitsTheForm ? connectedServerIds : [];
   const canCancel = state !== "unscoped";
   const loopbackClient = isLoopbackOrigin(flow?.client_origin ?? null);
   const vendorServers = vendorServersFor(state, flow);
@@ -130,10 +144,14 @@ const ConnectFlowBanner: React.FC<Props> = ({ flowHandle, flow, accessToken, onC
           ))}
           <form method="POST" action={action}>
             <input type="hidden" name="flow" value={flowHandle} />
+            {postedServerIds.map((serverId) => (
+              <input key={serverId} type="hidden" name="server" value={serverId} />
+            ))}
             {canFinish && (
               <button
                 type="submit"
-                className="h-[38px] rounded-md bg-primary px-4 text-sm font-semibold text-primary-foreground hover:bg-primary/90"
+                disabled={state === "unscoped" && connectedServerIds === null}
+                className="h-[38px] rounded-md bg-primary px-4 text-sm font-semibold text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
               >
                 {t("chat.connectFlowBanner.finish")}
               </button>

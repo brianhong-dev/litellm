@@ -27,7 +27,7 @@ const unscoped = (client_origin: string): ConnectFlowStatus => ({
   servers: null,
 });
 
-const renderBanner = (clientOrigin: string) =>
+const renderBanner = (clientOrigin: string, connectedServerIds: string[] | null = []) =>
   render(
     <ConnectFlowBanner
       flowHandle="flow-handle-123"
@@ -35,6 +35,7 @@ const renderBanner = (clientOrigin: string) =>
       accessToken="tok"
       onConnected={vi.fn()}
       failed={false}
+      connectedServerIds={connectedServerIds}
     />,
   );
 
@@ -49,6 +50,39 @@ describe("ConnectFlowBanner", () => {
     expect(form.innerHTML).not.toContain("token");
     expect(screen.getByRole("button", { name: /finish connecting/i })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Cancel" })).not.toBeInTheDocument();
+  });
+
+  it("posts the id of each server shown as connected with Finish", () => {
+    renderBanner("https://claude.ai", ["catalog-id", "atlassian-id"]);
+
+    expect(screen.getByDisplayValue("catalog-id")).toHaveAttribute("name", "server");
+    expect(screen.getByDisplayValue("atlassian-id")).toHaveAttribute("name", "server");
+    expect(screen.getByRole("button", { name: /finish connecting/i })).toBeEnabled();
+  });
+
+  it("holds Finish until the page has loaded its servers", () => {
+    renderBanner("https://claude.ai", null);
+
+    expect(screen.getByRole("button", { name: /finish connecting/i })).toBeDisabled();
+  });
+
+  it("posts no picks once they would pass the gateway's form field limit", () => {
+    const fits = Array.from({ length: 997 }, (_, i) => `server-${i}`);
+    const { rerender } = renderBanner("https://claude.ai", fits);
+    expect(screen.queryAllByDisplayValue(/^server-\d+$/)).toHaveLength(997);
+
+    rerender(
+      <ConnectFlowBanner
+        flowHandle="flow-handle-123"
+        flow={unscoped("https://claude.ai")}
+        accessToken="tok"
+        onConnected={vi.fn()}
+        failed={false}
+        connectedServerIds={[...fits, "server-997"]}
+      />,
+    );
+    expect(screen.queryAllByDisplayValue(/^server-\d+$/)).toHaveLength(0);
+    expect(screen.getByDisplayValue("flow-handle-123")).toHaveAttribute("name", "flow");
   });
 
   it("lists multi-server consent and requires every server before finishing", () => {

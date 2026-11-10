@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { Search, ArrowLeft, ChevronRight, Wrench, CheckCircle, Loader2 } from "lucide-react";
@@ -96,6 +96,8 @@ interface Props {
   selectedServers: string[];
   onChange: (servers: string[]) => void;
   connectMode?: boolean;
+  /** Reported only once the list has loaded. */
+  onConnectedServerIds?: (serverIds: string[]) => void;
 }
 
 const AVATAR_COLORS = [
@@ -121,7 +123,15 @@ type TabKey = "all" | "connected";
 
 const TOOLS_FETCH_CONCURRENCY = 5;
 
-const MCPAppsPanel: React.FC<Props> = ({ accessToken, selectedServers, onChange, connectMode }) => {
+const nameOf = (s: MCPServer) => s.server_name ?? s.alias ?? s.server_id;
+
+const MCPAppsPanel: React.FC<Props> = ({
+  accessToken,
+  selectedServers,
+  onChange,
+  connectMode,
+  onConnectedServerIds,
+}) => {
   const { t } = useTranslation();
   const [servers, setServers] = useState<MCPServer[]>([]);
   const [loading, setLoading] = useState(true);
@@ -147,8 +157,6 @@ const MCPAppsPanel: React.FC<Props> = ({ accessToken, selectedServers, onChange,
   useEffect(() => {
     onChangeRef.current = onChange;
   }, [onChange]);
-
-  const nameOf = (s: MCPServer) => s.server_name ?? s.alias ?? s.server_id;
 
   const detailServer = servers.find((s) => s.server_id === detailServerId);
 
@@ -342,9 +350,20 @@ const MCPAppsPanel: React.FC<Props> = ({ accessToken, selectedServers, onChange,
     return matchesQuery && matchesTab;
   });
 
-  const connectedCount = servers.filter(
-    (s) => selectedServers.includes(nameOf(s)) && connectUnavailabilityLabel(s) === null,
-  ).length;
+  const connectedServerIds = useMemo(
+    () => [
+      ...new Set(
+        servers
+          .filter((s) => selectedServers.includes(nameOf(s)) && connectUnavailabilityLabel(s) === null)
+          .map((s) => s.server_id),
+      ),
+    ],
+    [servers, selectedServers, connectUnavailabilityLabel],
+  );
+  const connectedCount = connectedServerIds.length;
+  useEffect(() => {
+    if (!loading) onConnectedServerIds?.(connectedServerIds);
+  }, [loading, connectedServerIds, onConnectedServerIds]);
 
   const emptyStateText = () => {
     if (servers.length === 0) {
