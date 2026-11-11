@@ -96,7 +96,6 @@ interface Props {
   selectedServers: string[];
   onChange: (servers: string[]) => void;
   connectMode?: boolean;
-  /** Not reported until every server's state is known, nor after a failed load. */
   onConnectedServerIds?: (serverIds: string[]) => void;
 }
 

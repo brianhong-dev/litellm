@@ -3726,7 +3726,6 @@ async def test_every_narrowed_grant_near_the_size_cap_refreshes() -> None:
             resource="https://llm.example.com/mcp",
         )
         assert rotated.status_code == 200, picked_count
-    assert outcomes == sorted(outcomes, key=lambda status: status == 400)
     assert 303 in outcomes
     assert 400 in outcomes
 

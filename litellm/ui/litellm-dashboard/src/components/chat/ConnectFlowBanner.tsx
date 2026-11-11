@@ -17,7 +17,6 @@ interface Props {
   accessToken: string;
   onConnected: () => void;
   failed: boolean;
-  /** null until the page knows which servers are on. */
   connectedServerIds?: string[] | null;
 }
 
