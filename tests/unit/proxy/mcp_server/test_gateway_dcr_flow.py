@@ -3712,6 +3712,9 @@ async def test_every_narrowed_grant_near_the_size_cap_refreshes() -> None:
         client_id, completed = await _complete_with_selection(tuple(server.server_id for server in picked), picked)
         outcomes.append(completed.status_code)
         if completed.status_code == 400:
+            assert json.loads(completed.body)["error_description"] == (
+                "too many MCP servers are turned on for one connection; turn some off and try again"
+            ), picked_count
             continue
         code, _ = _sealed_code_from(completed)
         cache = DualCache()
