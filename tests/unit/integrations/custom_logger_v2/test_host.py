@@ -107,7 +107,7 @@ def test_sync_passthrough_returns_the_legacy_value_and_propagates_its_exception(
         raise error
 
     assert run_legacy_hook_sync(Hook.attempt_ended, lambda patches: value, fields=_unused_fields) is value
-    with pytest.raises(ValueError) as raised:
+    with pytest.raises(ValueError, match="sync logger raised") as raised:
         run_legacy_hook_sync(Hook.attempt_ended, fails, fields=_unused_fields)
     assert raised.value is error
 

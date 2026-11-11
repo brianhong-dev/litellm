@@ -81,7 +81,7 @@ async def test_without_natives_a_legacy_handler_error_reaches_the_caller_unchang
     error: Final = ValueError("handler raised")
     monkeypatch.setattr(handlers, legacy, Recorded([], error))
 
-    with pytest.raises(ValueError) as raised:
+    with pytest.raises(ValueError, match="handler raised") as raised:
         await _public(public)("primary", {}, RuntimeError("original"))
 
     assert raised.value is error

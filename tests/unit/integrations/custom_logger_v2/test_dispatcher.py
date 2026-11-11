@@ -316,7 +316,7 @@ async def test_unexpected_exception_from_a_blocking_native_fails_the_request_clo
 
     scope = dispatcher(native("guard", behaviour=broken, may_abort=True)).open_scope(RequestSelection())
 
-    with pytest.raises(ValueError) as raised:
+    with pytest.raises(ValueError, match="vendor down") as raised:
         await scope.run_hook(Hook.pre_call, FIELDS, None, legacy)
 
     assert raised.value is error

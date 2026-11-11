@@ -182,7 +182,7 @@ async def test_pre_call_passthrough_propagates_the_legacy_exception(
     error: Final = ValueError("rejected by a legacy hook")
     monkeypatch.setattr(litellm, "callbacks", [_Legacy([], error=error)])
 
-    with pytest.raises(ValueError) as raised:
+    with pytest.raises(ValueError, match="rejected by a legacy hook") as raised:
         await proxy_logging.pre_call_hook(user_api_key_dict=AUTH, data={"model": "gpt-4o"}, call_type="completion")
 
     assert raised.value is error
@@ -252,7 +252,7 @@ async def test_post_call_success_passthrough_propagates_the_legacy_exception(
     error: Final = ValueError("response rejected")
     monkeypatch.setattr(litellm, "callbacks", [_Legacy([], error=error)])
 
-    with pytest.raises(ValueError) as raised:
+    with pytest.raises(ValueError, match="response rejected") as raised:
         await proxy_logging.post_call_success_hook(
             data={"model": "gpt-4o"}, response=ModelResponse(), user_api_key_dict=AUTH
         )
