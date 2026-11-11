@@ -9,7 +9,7 @@ Provides:
 import base64
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final
 from urllib.parse import urlsplit
@@ -29,6 +29,7 @@ from litellm.integrations.vector_store_integrations.vector_store_pre_call_hook i
 )
 from litellm.llms.vertex_ai.vertex_llm_base import VertexBase
 from litellm.proxy._types import *
+from litellm.proxy.auth.auth_checks import assert_allowed_without_access_groups
 from litellm.proxy.auth.auth_utils import get_request_route, is_request_body_safe
 from litellm.proxy.auth.user_api_key_auth import UserAPIKeyAuth, user_api_key_auth
 from litellm.proxy.common_request_processing import (
@@ -71,6 +72,7 @@ from litellm.proxy.vector_store_endpoints.endpoints import (
 )
 from litellm.proxy.vector_store_endpoints.utils import (
     assert_user_can_access_vector_store_id,
+    assert_user_can_read_vector_store_id,
     with_managed_search_file_ids,
 )
 from litellm.rag.ingestion.vertex_ai_ingestion import DEFAULT_VERTEX_RAG_LOCATION
@@ -79,7 +81,7 @@ from litellm.rag.rag_query import RAGQuery
 from litellm.repositories.table_repositories import ManagedVectorStoresRepository
 from litellm.repositories.user_repository import UserRepository
 from litellm.secret_managers.main import get_secret_str
-from litellm.types.rag import RAGIngestResponse
+from litellm.types.rag import RAGIngestResponse, RAGRetrievalConfig
 from litellm.types.utils import Choices, ModelResponse
 
 if TYPE_CHECKING:
@@ -88,6 +90,7 @@ if TYPE_CHECKING:
 
 router: Final = APIRouter()
 _TEAM_PROVIDER_CREDENTIALS_ADAPTER: Final = TypeAdapter(dict[str, object])
+_RETRIEVAL_FIELDS: Final = RAGRetrievalConfig.__required_keys__ | RAGRetrievalConfig.__optional_keys__
 _EMPTY_TEAM_PROVIDER_CREDENTIALS: Final[Mapping[str, object]] = MappingProxyType({})
 _TEAM_CREDENTIAL_PROVIDER: Final = "openai"
 
@@ -171,22 +174,29 @@ def _collect_vector_store_ids_from_payload(payload: object) -> set[str]:
     return vector_store_ids
 
 
+def _as_on_main(request: Request) -> Callable[[str, UserAPIKeyAuth], Awaitable[LiteLLM_ManagedVectorStore | None]]:
+    async def authorize(vector_store_id: str, user_api_key_dict: UserAPIKeyAuth) -> LiteLLM_ManagedVectorStore | None:
+        try:
+            assert_allowed_without_access_groups(request)
+        except ProxyException as refusal:
+            # The route turns anything but an HTTPException into a provider error.
+            raise HTTPException(status_code=int(refusal.code), detail={"error": refusal.message}) from refusal
+        return await assert_user_can_access_vector_store_id(vector_store_id, user_api_key_dict)
+
+    return authorize
+
+
 async def _authorize_nested_vector_store_ids(
     payload: object,
     user_api_key_dict: UserAPIKeyAuth,
+    authorize: Callable[[str, UserAPIKeyAuth], Awaitable[LiteLLM_ManagedVectorStore | None]],
 ) -> Mapping[str, LiteLLM_ManagedVectorStore]:
     """Authorize every nested vector store id and return the managed stores it resolved."""
     return MappingProxyType(
         {
             vector_store_id: store
             for vector_store_id in sorted(_collect_vector_store_ids_from_payload(payload))
-            if (
-                store := await assert_user_can_access_vector_store_id(
-                    vector_store_id=vector_store_id,
-                    user_api_key_dict=user_api_key_dict,
-                )
-            )
-            is not None
+            if (store := await authorize(vector_store_id, user_api_key_dict)) is not None
         }
     )
 
@@ -881,6 +891,7 @@ async def rag_ingest(
         resolved_stores: Final = await _authorize_nested_vector_store_ids(
             payload=ingest_options,
             user_api_key_dict=user_api_key_dict,
+            authorize=_as_on_main(request),
         )
 
         request_vector_store_config: Final = ingest_options.get("vector_store", {})
@@ -1136,6 +1147,10 @@ async def rag_query(
         resolved_stores: Final = await _authorize_nested_vector_store_ids(
             payload=retrieval_config,
             user_api_key_dict=user_api_key_dict,
+            # Any other field can point the provider past the store's own settings.
+            authorize=assert_user_can_read_vector_store_id
+            if retrieval_config.keys() <= _RETRIEVAL_FIELDS
+            else _as_on_main(request),
         )
 
         # Merge litellm-managed vector store params (provider, region, embedding

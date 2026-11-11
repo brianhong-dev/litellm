@@ -10,7 +10,7 @@ All /vector_store management endpoints
 
 import copy
 import json
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING, Any, Final
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -31,10 +31,12 @@ from litellm.proxy._types import (
     ResponseLiteLLM_ManagedVectorStore,
     UserAPIKeyAuth,
 )
+from litellm.proxy.auth.auth_checks import assert_allowed_without_access_groups
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.rbac_utils import check_feature_access_for_user
 from litellm.proxy.vector_store_endpoints.utils import (
     can_user_access_vector_store,
+    can_user_read_vector_store,
     filter_listable_vector_stores,
 )
 from litellm.repositories.prisma_protocols import TableActions
@@ -148,6 +150,7 @@ async def _fetch_and_authorize_vector_store(
     vector_store_id: str,
     user_api_key_dict: UserAPIKeyAuth,
     prisma_client: "PrismaClient",
+    is_authorized: Callable[[LiteLLM_ManagedVectorStore, UserAPIKeyAuth], Awaitable[bool]],
 ) -> "LiteLLM_ManagedVectorStore":
     """
     Look up a vector store by id and confirm the caller can access it.
@@ -161,7 +164,7 @@ async def _fetch_and_authorize_vector_store(
             detail=f"Vector store with ID {vector_store_id} not found",
         )
     typed: Final = _row_to_vector_store(row)
-    if not await _check_vector_store_access(typed, user_api_key_dict):
+    if not await is_authorized(typed, user_api_key_dict):
         raise HTTPException(
             status_code=403,
             detail="Access denied: You do not have permission to access this vector store",
@@ -284,7 +287,7 @@ async def create_vector_store_in_db(
 @router.post(
     "/vector_store/new",
     tags=["vector store management"],
-    dependencies=[Depends(user_api_key_auth)],
+    dependencies=[Depends(user_api_key_auth), Depends(assert_allowed_without_access_groups)],
 )
 async def new_vector_store(
     vector_store: LiteLLM_ManagedVectorStore,
@@ -467,7 +470,7 @@ async def list_vector_stores(
 @router.post(
     "/vector_store/delete",
     tags=["vector store management"],
-    dependencies=[Depends(user_api_key_auth)],
+    dependencies=[Depends(user_api_key_auth), Depends(assert_allowed_without_access_groups)],
 )
 async def delete_vector_store(
     data: VectorStoreDeleteRequest,
@@ -568,7 +571,7 @@ async def get_vector_store_info(
             )
             if vector_store is not None:
                 # Check access control
-                if not await _check_vector_store_access(vector_store, user_api_key_dict):
+                if not await can_user_read_vector_store(vector_store, user_api_key_dict):
                     raise HTTPException(
                         status_code=403,
                         detail="Access denied: You do not have permission to access this vector store",
@@ -602,6 +605,7 @@ async def get_vector_store_info(
             vector_store_id=data.vector_store_id,
             user_api_key_dict=user_api_key_dict,
             prisma_client=prisma_client,
+            is_authorized=can_user_read_vector_store,
         )
         vector_store_dict: Final = dict(vector_store_typed)
         if "litellm_params" in vector_store_dict:
@@ -619,7 +623,7 @@ async def get_vector_store_info(
 @router.post(
     "/vector_store/update",
     tags=["vector store management"],
-    dependencies=[Depends(user_api_key_auth)],
+    dependencies=[Depends(user_api_key_auth), Depends(assert_allowed_without_access_groups)],
 )
 async def update_vector_store(
     data: VectorStoreUpdateRequest,
@@ -650,6 +654,7 @@ async def update_vector_store(
             vector_store_id=vector_store_id,
             user_api_key_dict=user_api_key_dict,
             prisma_client=prisma_client,
+            is_authorized=_check_vector_store_access,
         )
 
         # Handle metadata serialization

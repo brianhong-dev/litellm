@@ -83,6 +83,7 @@ from litellm.llms.openai.common_utils import OpenAIError as LiteLLMOpenAIError
 from litellm.llms.openai.common_utils import is_openai_agents_api_path, openai_api_resource
 from litellm.llms.openai.workload_identity import get_workload_identity_bearer_token_for_api_base
 from litellm.llms.oss_decision import OssDecisionProvider, oss_connection, validate_oss_request
+from litellm.llms.vertex_ai.vector_stores.search_api.transformation import VERTEX_SEARCH_DATASTORE_EXTRA_BODY_FIELDS
 from litellm.llms.vertex_ai.vertex_llm_base import VertexBase
 from litellm.llms.vllm.common_utils import endpoint_under_api_base
 from litellm.passthrough.main import AsyncPassthroughStreamingResponse, is_provider_error
@@ -166,6 +167,7 @@ from litellm.proxy.vector_store_endpoints.endpoints import build_request_data_fr
 from litellm.proxy.vector_store_endpoints.utils import (
     assert_proxy_admin_for_vector_store_index_management,
     assert_user_can_access_vector_store,
+    assert_user_can_call_vector_store_passthrough,
     assert_vector_store_index_access,
     get_litellm_managed_vector_store,
     has_vector_store_index_access,
@@ -1077,9 +1079,12 @@ async def milvus_proxy_route(
     )
     if vector_store is None:
         raise Exception(f"Vector store not found for {vector_store_name}")
-    await assert_user_can_access_vector_store(
-        vector_store=vector_store,
-        user_api_key_dict=user_api_key_dict,
+    await assert_user_can_call_vector_store_passthrough(
+        vector_store,
+        user_api_key_dict,
+        provider_config if _milvus_request_stays_on_store(request_body, vector_store) else None,
+        request,
+        endpoint,
     )
     litellm_params = vector_store.get("litellm_params") or {}
     auth_credentials: Final = provider_config.get_auth_credentials(litellm_params=litellm_params)
@@ -2838,9 +2843,18 @@ async def azure_proxy_route(
                 )
                 if vector_store is None:
                     raise Exception(f"Vector store not found for {vector_store_name}")
-                await assert_user_can_access_vector_store(
-                    vector_store=vector_store,
-                    user_api_key_dict=user_api_key_dict,
+                await assert_user_can_call_vector_store_passthrough(
+                    vector_store,
+                    user_api_key_dict,
+                    # Reads address the index from the root; elsewhere the name can belong to another resource.
+                    # The path is forwarded as is, so it must name the store's own Azure index.
+                    provider_config
+                    if endpoint.lstrip("/").split("/", 1)[0] == "indexes"
+                    and part == index_object.litellm_params.vector_store_index
+                    else None,
+                    request,
+                    endpoint,
+                    store_segment="indexes",
                 )
                 litellm_params = vector_store.get("litellm_params") or {}
                 auth_credentials = provider_config.get_auth_credentials(litellm_params=litellm_params)
@@ -3316,6 +3330,69 @@ async def _prepare_vertex_auth_headers(
     )
 
 
+# The generic forwarder sends these in place of the body or URL the gate checked.
+_FORWARDER_ENVELOPE_KEYS: Final = frozenset({"custom_body", "query_params"})
+_MILVUS_SCOPE_KEYS: Final = frozenset({"collectionName", "dbName", "partitionNames"})
+_MILVUS_SCOPE_KEYS_FOLDED: Final = frozenset(key.casefold() for key in _MILVUS_SCOPE_KEYS)
+
+
+def _milvus_request_stays_on_store(
+    request_body: Mapping[str, object], vector_store: LiteLLM_ManagedVectorStore
+) -> bool:
+    """The route pins the collection, but the forwarded body still picks the database and partitions,
+    and Milvus matches those keys in any case, which some of its JSON decoders fold past ASCII."""
+    if not _FORWARDER_ENVELOPE_KEYS.isdisjoint(request_body) or any(
+        not key.isascii() or (key not in _MILVUS_SCOPE_KEYS and key.casefold() in _MILVUS_SCOPE_KEYS_FOLDED)
+        for key in request_body
+    ):
+        return False
+    litellm_params: Final = vector_store.get("litellm_params") or {}
+    store_partitions: Final = litellm_params.get("milvus_partition_names")
+    partitions: Final = as_object_list(request_body.get("partitionNames"))
+    return request_body.get("dbName") == litellm_params.get("milvus_db_name") and (
+        not store_partitions
+        or (
+            bool(partitions)
+            and all(isinstance(partition, str) and partition in store_partitions for partition in partitions or ())
+        )
+    )
+
+
+# The forwarder rewrites and reads only this exact prefix, so any other spelling could reach another project.
+_VERTEX_DATASTORE_PATH: Final = re.compile(r"/?v1\w*/projects/[^/]+/locations/[^/]+/collections/([^/]+)/dataStores/")
+# Google reads system parameters such as $userProject or key from the query, so a read keeps to paging.
+_VERTEX_PAGING_PARAMS: Final = frozenset({"pageSize", "pageToken"})
+
+
+async def _vertex_request_stays_on_store(
+    request: Request,
+    endpoint: str,
+    target: tuple[str | None, str | None],
+    vector_store: LiteLLM_ManagedVectorStore,
+) -> bool:
+    """`target` is the project and location the request goes to, which the forwarder takes from the URL
+    unless the store sets `vertex_project` and `vertex_location` exactly."""
+    litellm_params: Final = dict(vector_store.get("litellm_params") or {})
+    registered: Final = (
+        VertexBase.safe_get_vertex_ai_project(litellm_params),  # pyright: ignore[reportUnknownMemberType]  # VertexBase types litellm_params as a bare dict
+        VertexBase.safe_get_vertex_ai_location(litellm_params),  # pyright: ignore[reportUnknownMemberType]  # VertexBase types litellm_params as a bare dict
+    )
+    if None in registered or target != registered:
+        return False
+    store_collection: Final = litellm_params.get("vertex_collection_id") or "default_collection"
+    collection: Final = _VERTEX_DATASTORE_PATH.match(endpoint)
+    if collection is None or collection.group(1) != store_collection:
+        return False
+    try:
+        request_body: Final = await get_request_body(request)
+    except ValueError:
+        return False
+    # The fields LiteLLM's own data-store search forwards; others, such as dataStoreSpecs, can pick the target.
+    return _VERTEX_PAGING_PARAMS.issuperset(request.query_params.keys()) and (
+        VERTEX_SEARCH_DATASTORE_EXTRA_BODY_FIELDS.issuperset(request_body)
+    )
+
+
 async def _base_vertex_proxy_route(
     endpoint: str,
     request: Request,
@@ -3352,11 +3429,7 @@ async def _base_vertex_proxy_route(
     encoded_endpoint = httpx.URL(endpoint).path
     verbose_proxy_logger.debug("requested endpoint %s", endpoint)
     headers: Mapping[str, str] = {}
-    if router_credentials is not None:
-        await assert_user_can_access_vector_store(
-            vector_store=router_credentials,
-            user_api_key_dict=user_api_key_dict,
-        )
+    requested_endpoint: Final = endpoint
 
     vertex_project: str | None = get_vertex_project_id_from_url(endpoint)
     vertex_location: str | None = get_vertex_location_from_url(endpoint)
@@ -3389,6 +3462,22 @@ async def _base_vertex_proxy_route(
             )
             if deployment_model_info:
                 setattr(request.state, LITELLM_PASS_THROUGH_DEPLOYMENT_MODEL_INFO_STATE_KEY, deployment_model_info)
+
+    if router_credentials is not None:
+        await assert_user_can_call_vector_store_passthrough(
+            router_credentials,
+            user_api_key_dict,
+            # A path the router rewrote is no longer the one the gate would check, so it is never a read.
+            None
+            if endpoint != requested_endpoint
+            or not await _vertex_request_stays_on_store(
+                request, requested_endpoint, (vertex_project, vertex_location), router_credentials
+            )
+            else ProviderConfigManager.get_provider_vector_stores_config(LlmProviders.VERTEX_AI, "search_api"),
+            request,
+            requested_endpoint,
+            store_segment="dataStores",
+        )
 
     vertex_credentials: Final = passthrough_endpoint_router.get_vertex_credentials(
         project_id=vertex_project,

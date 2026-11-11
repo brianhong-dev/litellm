@@ -54,6 +54,7 @@ from litellm.llms.base_llm.managed_resources.utils import (
     is_base64_encoded_unified_id,
 )
 from litellm.models.project import LiteLLM_ProjectTable
+from litellm.models.team import LiteLLM_TeamRebuiltFromToken
 from litellm.proxy._types import (
     MODEL_LIST_ROUTES,
     RBAC_ROLES,
@@ -1591,7 +1592,10 @@ async def common_checks(
             user_object=user_object,
             deny_by_default=_vector_store_deny_by_default(_typed_request_body(general_settings)),
             llm_router=llm_router,
+            request=request,
         )
+        if _recorded_refusal(request) is not None and _served_by_provider_pass_through(request):
+            assert_allowed_without_access_groups(request)
 
     # 12. [OPTIONAL] Tool allowlist - key/team allowed_tools (no DB in hot path)
     with tracer.trace("litellm.proxy.auth.common_checks.check_tools_allowlist"):
@@ -5807,6 +5811,17 @@ async def can_team_access_model(
         raise
 
 
+def _group_grants_key(
+    group: LiteLLM_AccessGroupTable, valid_token: UserAPIKeyAuth, team_object: LiteLLM_TeamTable | None
+) -> bool:
+    key_team_id: Final = valid_token.team_id or (team_object.team_id if team_object is not None else None)
+    return (
+        bool(key_team_id and key_team_id in (group.assigned_team_ids or []))
+        or bool(valid_token.token and valid_token.token in (group.assigned_key_ids or []))
+        or group.access_group_id in valid_token.access_group_rule_grants
+    )
+
+
 async def get_authorized_resources_from_key_access_groups(
     valid_token: UserAPIKeyAuth | None,
     team_object: LiteLLM_TeamTable | None,
@@ -5835,9 +5850,6 @@ async def get_authorized_resources_from_key_access_groups(
     if _prisma_client is None or _user_api_key_cache is None:
         return []
 
-    key_team_id: Final = valid_token.team_id or (team_object.team_id if team_object is not None else None)
-    key_token: Final = valid_token.token
-
     authorized_resources: Final[list[str]] = []
     for ag_id in key_access_group_ids:
         try:
@@ -5856,9 +5868,7 @@ async def get_authorized_resources_from_key_access_groups(
             if check_db_only or strict_errors:
                 raise
             continue
-        team_authorized = bool(key_team_id and key_team_id in (ag.assigned_team_ids or []))
-        key_authorized = bool(key_token and key_token in (ag.assigned_key_ids or []))
-        if team_authorized or key_authorized or ag_id in valid_token.access_group_rule_grants:
+        if _group_grants_key(ag, valid_token, team_object):
             authorized_resources.extend(getattr(ag, resource_field, []) or [])
 
     return list(set(authorized_resources))
@@ -7956,6 +7966,7 @@ async def _identity_grants(
     user_object: LiteLLM_UserTable | None,
     prisma_client: PrismaClient,
     user_api_key_cache: UserApiKeyCache,
+    unreadable: Literal["none", "raise"] = "none",
 ) -> tuple[tuple[GrantLayer, LiteLLM_ObjectPermissionTable | None], ...]:
     return (
         (
@@ -7963,7 +7974,11 @@ async def _identity_grants(
             None
             if valid_token is None
             else await _cached_object_permission(
-                valid_token.object_permission_id, valid_token.object_permission, prisma_client, user_api_key_cache
+                valid_token.object_permission_id,
+                valid_token.object_permission,
+                prisma_client,
+                user_api_key_cache,
+                unreadable,
             ),
         ),
         (
@@ -7971,7 +7986,11 @@ async def _identity_grants(
             None
             if team_object is None
             else await _cached_object_permission(
-                team_object.object_permission_id, team_object.object_permission, prisma_client, user_api_key_cache
+                team_object.object_permission_id,
+                team_object.object_permission,
+                prisma_client,
+                user_api_key_cache,
+                unreadable,
             ),
         ),
         (
@@ -7979,7 +7998,11 @@ async def _identity_grants(
             None
             if user_object is None
             else await _cached_object_permission(
-                user_object.object_permission_id, user_object.object_permission, prisma_client, user_api_key_cache
+                user_object.object_permission_id,
+                user_object.object_permission,
+                prisma_client,
+                user_api_key_cache,
+                unreadable,
             ),
         ),
     )
@@ -8095,8 +8118,270 @@ def _legacy_requested_vector_store_ids(
     )
 
 
-def _restricts_vector_stores(grants: Sequence[tuple[GrantLayer, LiteLLM_ObjectPermissionTable | None]]) -> bool:
-    return any(grant is not None and bool(grant.vector_stores) for _, grant in grants)
+async def access_group_vector_stores(
+    valid_token: UserAPIKeyAuth | None, team_object: LiteLLM_TeamTable | None
+) -> Mapping[GrantLayer, tuple[str, ...]]:
+    """Stores the key's and its team's access groups grant, per layer.
+    A deleted group grants nothing, and an unreadable one raises."""
+    key_groups: Final = await get_access_group_tables(
+        (valid_token.access_group_ids or ()) if valid_token is not None else (), unreadable="raise"
+    )
+    team_groups: Final = await get_access_group_tables(
+        (team_object.access_group_ids or ()) if team_object is not None else (), unreadable="raise"
+    )
+    listed_key_groups: Final = (
+        tuple(group for group in key_groups if _group_grants_key(group, valid_token, team_object))
+        if valid_token is not None
+        else ()
+    )
+    return MappingProxyType(
+        {
+            "key": tuple(chain.from_iterable(group.access_vector_store_ids for group in listed_key_groups)),
+            "team": tuple(chain.from_iterable(group.access_vector_store_ids for group in team_groups)),
+        }
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _CombinedVectorStores:
+    vector_stores: Sequence[str]
+    own_stores: tuple[str, ...] = ()
+    group_covered: frozenset[str] = frozenset()
+    has_group_stores: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _VectorStoreGrants:
+    own: tuple[tuple[GrantLayer, _CombinedVectorStores], ...]
+    with_groups: tuple[tuple[GrantLayer, _CombinedVectorStores], ...]
+
+
+def _with_group_stores(
+    grant: LiteLLM_ObjectPermissionTable | None, group_stores: Sequence[str], group_covered: frozenset[str]
+) -> _CombinedVectorStores:
+    own_stores: Final = tuple(grant.vector_stores or ()) if grant is not None else ()
+    return _CombinedVectorStores([*own_stores, *group_stores], own_stores, group_covered, bool(group_stores))
+
+
+def _layer_grants(
+    identity: Sequence[tuple[GrantLayer, LiteLLM_ObjectPermissionTable | None]],
+    group_stores: Mapping[GrantLayer, tuple[str, ...]],
+    group_covered: Mapping[GrantLayer, frozenset[str]],
+) -> tuple[tuple[GrantLayer, _CombinedVectorStores], ...]:
+    return tuple(
+        (layer, _with_group_stores(grant, group_stores.get(layer, ()), group_covered.get(layer, frozenset())))
+        for layer, grant in identity
+    )
+
+
+async def _is_registered_vector_store_id(vector_store_id: str, prisma_client: PrismaClient) -> bool:
+    registry: Final = litellm.vector_store_registry
+    if registry is not None and registry.get_litellm_managed_vector_store_from_registry(vector_store_id) is not None:
+        return True
+    row: Final = await _vector_store_table(ManagedVectorStoresRepository(prisma_client)).find_unique(
+        where={"vector_store_id": vector_store_id}
+    )
+    return row is not None
+
+
+async def _group_covered_ids(
+    listed: Sequence[str], requested: Sequence[str], prisma_client: PrismaClient
+) -> frozenset[str]:
+    """A group covers the stores it lists, and the raw provider id inside a managed id it lists, unless a registered
+    store uses that raw id as its own, since that store is the one the request runs on."""
+    decoded: Final = frozenset(
+        provider_vector_store_id(store) for store in listed if is_base64_encoded_unified_id(store)
+    )
+    return frozenset(
+        [
+            store
+            for store in requested
+            if store in listed or (store in decoded and not await _is_registered_vector_store_id(store, prisma_client))
+        ]
+    )
+
+
+async def _grants_with_group_stores(
+    group_stores: Mapping[GrantLayer, tuple[str, ...]],
+    valid_token: UserAPIKeyAuth | None,
+    team_object: LiteLLM_TeamTable | None,
+    user_object: LiteLLM_UserTable | None,
+    prisma_client: PrismaClient,
+    user_api_key_cache: UserApiKeyCache,
+) -> tuple[tuple[GrantLayer, _CombinedVectorStores], ...]:
+    return _layer_grants(
+        await _identity_grants(valid_token, team_object, user_object, prisma_client, user_api_key_cache, "raise"),
+        group_stores,
+        {layer: frozenset(stores) for layer, stores in group_stores.items()},
+    )
+
+
+async def _team_for_group_check(
+    valid_token: UserAPIKeyAuth | None, team_object: LiteLLM_TeamTable | None, team_is_strict: bool
+) -> LiteLLM_TeamTable | None:
+    """A team we cannot read must deny, not widen: auth's rebuilt stand-in has none of the team's groups.
+    A strict team layer can only lose grants without them, so it keeps the stand-in."""
+    team_id: Final = valid_token.team_id if valid_token is not None else None
+    if (
+        team_is_strict
+        or not isinstance(team_object, LiteLLM_TeamRebuiltFromToken)
+        or valid_token is None
+        or team_id is None
+        or team_id == UI_TEAM_ID
+    ):
+        return team_object
+    from litellm.proxy.proxy_server import prisma_client, proxy_logging_obj, user_api_key_cache
+
+    return await get_team_object(
+        team_id=team_id,
+        prisma_client=prisma_client,
+        user_api_key_cache=user_api_key_cache,
+        parent_otel_span=valid_token.parent_otel_span,
+        proxy_logging_obj=proxy_logging_obj,
+    )
+
+
+async def _combined_vector_store_grants(
+    valid_token: UserAPIKeyAuth | None,
+    team_object: LiteLLM_TeamTable | None,
+    user_object: LiteLLM_UserTable | None,
+    prisma_client: PrismaClient,
+    user_api_key_cache: UserApiKeyCache,
+    team_is_strict: bool = False,
+    vector_store_ids: Sequence[str] = (),
+) -> _VectorStoreGrants:
+    try:
+        team: Final = await _team_for_group_check(valid_token, team_object, team_is_strict)
+        group_stores: Final = await access_group_vector_stores(valid_token, team)
+        identity: Final = await _identity_grants(
+            valid_token,
+            team,
+            user_object,
+            prisma_client,
+            user_api_key_cache,
+            "raise" if any(group_stores.values()) else "none",
+        )
+        group_covered: Final[Mapping[GrantLayer, frozenset[str]]] = {
+            layer: await _group_covered_ids(stores, vector_store_ids, prisma_client)
+            for layer, stores in group_stores.items()
+            if stores
+        }
+    except Exception as e:
+        # Skipping an unreadable team or group could empty a list and lift the restriction.
+        raise ProxyException(
+            message="Could not read the team, its access groups or a store list to check vector store access",
+            type=ProxyErrorTypes.internal_server_error,
+            param="vector_store",
+            code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        ) from e
+    return _VectorStoreGrants(
+        own=_layer_grants(identity, {}, {}), with_groups=_layer_grants(identity, group_stores, group_covered)
+    )
+
+
+def _require_every_layer_allows(
+    grants: Sequence[tuple[GrantLayer, _CombinedVectorStores]],
+    strict_layers: frozenset[GrantLayer],
+    vector_store_ids: Sequence[str],
+) -> None:
+    for layer, grant in grants:
+        if grant.has_group_stores:
+            _require_group_layer_allows(layer, grant, vector_store_ids)
+        elif layer in strict_layers:
+            _require_vector_store_grant(layer, vector_store_ids, grant)
+        else:
+            _can_object_call_vector_stores(
+                object_type=layer,
+                vector_store_ids_to_run=vector_store_ids,
+                object_permissions=grant,
+            )
+
+
+def _require_group_layer_allows(
+    layer: GrantLayer, grant: _CombinedVectorStores, vector_store_ids: Sequence[str]
+) -> None:
+    """Own stores match the way main matches them, by provider id. Group stores match only what they cover."""
+    own: Final = frozenset(map(provider_vector_store_id, grant.own_stores))
+    for vector_store_id in vector_store_ids:
+        if vector_store_id not in grant.group_covered and provider_vector_store_id(vector_store_id) not in own:
+            raise ProxyException(
+                message=f"User not allowed to access vector store. Tried to access {vector_store_id}. Only allowed to access {grant.vector_stores}",
+                type=ProxyErrorTypes.get_vector_store_access_error_type_for_object(layer),
+                param="vector_store",
+                code=status.HTTP_401_UNAUTHORIZED,
+            )
+
+
+def _refusal(
+    grants: Sequence[tuple[GrantLayer, _CombinedVectorStores]],
+    strict_layers: frozenset[GrantLayer],
+    vector_store_ids: Sequence[str],
+) -> ProxyException | None:
+    try:
+        _require_every_layer_allows(grants, strict_layers, vector_store_ids)
+    except ProxyException as refusal:
+        return refusal
+    return None
+
+
+def _every_layer_allows(
+    grants: Sequence[tuple[GrantLayer, _CombinedVectorStores]],
+    strict_layers: frozenset[GrantLayer],
+    vector_store_id: str,
+) -> bool:
+    return _refusal(grants, strict_layers, (vector_store_id,)) is None
+
+
+async def vector_stores_opened_by_groups(
+    valid_token: UserAPIKeyAuth, team_object: LiteLLM_TeamTable | None
+) -> frozenset[str]:
+    """The stores the caller's groups list and the request check would allow. An unreadable group raises."""
+    from litellm.proxy.proxy_server import (
+        general_settings,  # pyright: ignore[reportUnknownVariableType]  # untyped module-level dict in proxy_server
+        prisma_client,
+        user_api_key_cache,
+    )
+
+    group_stores: Final = await access_group_vector_stores(valid_token, team_object)
+    listed: Final = tuple(chain.from_iterable(group_stores.values()))
+    if not listed or prisma_client is None:
+        return frozenset()
+    grants: Final = await _grants_with_group_stores(
+        group_stores, valid_token, team_object, None, prisma_client, user_api_key_cache
+    )
+    strict_layers: Final = _strict_grant_layers(
+        _vector_store_deny_by_default(_typed_request_body(general_settings)), valid_token, team_object
+    )
+    return frozenset(store for store in listed if _every_layer_allows(grants, strict_layers, store))
+
+
+_VECTOR_STORE_REFUSAL_WITHOUT_GROUPS: Final = "litellm_vector_store_refusal_without_groups"
+
+
+def _served_by_provider_pass_through(request: Request) -> bool:
+    """Access groups open only the vector store routes that check them, so a provider pass-through, router relays
+    included, decides as on main. Every built-in one lives in the pass-through package."""
+    module: Final[object] = getattr(request.scope.get("endpoint"), "__module__", None)
+    return request_dispatched_to_pass_through_endpoint(request) or (
+        isinstance(module, str) and module.startswith("litellm.proxy.pass_through_endpoints.")
+    )
+
+
+def assert_allowed_without_access_groups(request: Request) -> None:
+    """Raises the refusal the request check would give without access groups, for a request groups must not
+    decide: a change, or one that leaves the store's own settings. Nothing is recorded when the check did not run."""
+    refusal: Final = _recorded_refusal(request)
+    if refusal is not None:
+        raise refusal
+
+
+def _recorded_refusal(request: Request) -> ProxyException | None:
+    refusal: Final[object] = getattr(getattr(request, "state", None), _VECTOR_STORE_REFUSAL_WITHOUT_GROUPS, None)
+    return refusal if isinstance(refusal, ProxyException) else None
+
+
+def _restricts_vector_stores(grants: Sequence[tuple[GrantLayer, _CombinedVectorStores]]) -> bool:
+    return any(bool(grant.vector_stores) for _, grant in grants)
 
 
 def _request_drop_policies(
@@ -8131,20 +8416,35 @@ async def _cached_object_permission(
     loaded: LiteLLM_ObjectPermissionTable | None,
     prisma_client: PrismaClient,
     user_api_key_cache: UserApiKeyCache,
+    unreadable: Literal["none", "raise"] = "none",
 ) -> LiteLLM_ObjectPermissionTable | None:
     """
     The grant row auth already attached to the key, team or user, else the cached row by id. Both are
     evicted on every worker when the grant changes, so the request path never reads the table directly.
+    With `unreadable="raise"`, a row that exists but cannot be read raises instead of granting as no list.
     """
     if object_permission_id is None:
         return None
     if loaded is not None:
         return loaded
-    return await get_object_permission(
+    found: Final = await get_object_permission(
         object_permission_id=object_permission_id,
         prisma_client=prisma_client,
         user_api_key_cache=user_api_key_cache,
     )
+    if found is not None or unreadable == "none":
+        return found
+    try:
+        return await get_object_permission(
+            object_permission_id=object_permission_id,
+            prisma_client=prisma_client,
+            user_api_key_cache=user_api_key_cache,
+            check_db_only=True,
+        )
+    except HTTPException as missing:
+        if missing.status_code != status.HTTP_403_FORBIDDEN:
+            raise
+        return None
 
 
 async def vector_store_access_check(
@@ -8155,13 +8455,14 @@ async def vector_store_access_check(
     user_object: LiteLLM_UserTable | None = None,
     deny_by_default: bool = False,
     llm_router: Router | None = None,
-):
+    request: Request | None = None,
+) -> Literal[True]:
     """
     Checks whether the caller may use every vector store the request names.
 
     Requested stores come from `vector_store_ids`, `tools[].vector_store_ids`, the tools of
     `additional_tools` input items and the RAG `retrieval_config.vector_store_id`. Grants come from each identity's
-    `object_permission.vector_stores`.
+    `object_permission.vector_stores` plus the stores its access groups grant.
 
     Both modes read the same request fields, with or without a vector store registry, and answer 400
     when the top-level `vector_store_ids` is not a list of strings, which legacy mode does only when the
@@ -8186,6 +8487,9 @@ async def vector_store_access_check(
     The user's personal grant is only consulted in the keyless no-team case, so it can neither
     rescue nor restrict a key or team request.
 
+    Records on `request` the refusal the caller's own grants give without its access groups, for routes that
+    change a store.
+
     Raises ProxyException (401, `{key,team,user}_vector_store_access_denied`) on the first identity
     that does not grant a requested store, and ProxyException (400, `invalid_request_error`) on a
     malformed `vector_store_ids` the request does not drop and, in legacy mode, an allowlist applies to.
@@ -8209,7 +8513,9 @@ async def vector_store_access_check(
     )
     if isinstance(requested_ids, _UnreadableVectorStoreIds):
         if _restricts_vector_stores(
-            await _identity_grants(valid_token, team_object, None, prisma_client, user_api_key_cache)
+            (
+                await _combined_vector_store_grants(valid_token, team_object, None, prisma_client, user_api_key_cache)
+            ).with_groups
         ):
             raise _malformed_vector_store_ids()
         return True
@@ -8223,26 +8529,26 @@ async def vector_store_access_check(
     # Check if the object (key, team, org) has access to the vector store
     #########################################################
     strict_layers: Final = _strict_grant_layers(deny_by_default, valid_token, team_object)
-    grants: Final = await _identity_grants(
+    grants: Final = await _combined_vector_store_grants(
         valid_token,
         team_object,
         user_object if "user" in strict_layers else None,
         prisma_client,
         user_api_key_cache,
+        team_is_strict="team" in strict_layers,
+        vector_store_ids=vector_store_ids_to_run,
     )
-    for layer, grant in grants:
-        if layer in strict_layers:
-            _require_vector_store_grant(layer, vector_store_ids_to_run, grant)
-        elif grant is not None:
-            _can_object_call_vector_stores(
-                object_type=layer,
-                vector_store_ids_to_run=vector_store_ids_to_run,
-                object_permissions=grant,
-            )
+    _require_every_layer_allows(grants.with_groups, strict_layers, vector_store_ids_to_run)
+    if request is not None:
+        setattr(
+            request.state,
+            _VECTOR_STORE_REFUSAL_WITHOUT_GROUPS,
+            _refusal(grants.own, strict_layers, vector_store_ids_to_run),
+        )
     return True
 
 
-def _provider_vector_store_id(vector_store_id: str) -> str:
+def provider_vector_store_id(vector_store_id: str) -> str:
     if not is_base64_encoded_unified_id(vector_store_id):
         return vector_store_id
     return extract_provider_resource_id_from_unified_id(vector_store_id) or vector_store_id
@@ -8252,7 +8558,7 @@ def _can_object_call_vector_stores(
     object_type: Literal["key", "team", "org", "user"],
     vector_store_ids_to_run: Sequence[str],
     object_permissions: _VectorStorePermissionsRow | None,
-):
+) -> Literal[True]:
     """
     Raises ProxyException if the object (key, team, org) cannot access the specific vector store.
     """
@@ -8266,9 +8572,9 @@ def _can_object_call_vector_stores(
     if len(object_permissions.vector_stores) == 0:
         return True
 
-    allowed_stores: Final = frozenset(map(_provider_vector_store_id, object_permissions.vector_stores))
+    allowed_stores: Final = frozenset(map(provider_vector_store_id, object_permissions.vector_stores))
     for vector_store_id in vector_store_ids_to_run:
-        if _provider_vector_store_id(vector_store_id) not in allowed_stores:
+        if provider_vector_store_id(vector_store_id) not in allowed_stores:
             raise ProxyException(
                 message=f"User not allowed to access vector store. Tried to access {vector_store_id}. Only allowed to access {object_permissions.vector_stores}",
                 type=ProxyErrorTypes.get_vector_store_access_error_type_for_object(object_type),

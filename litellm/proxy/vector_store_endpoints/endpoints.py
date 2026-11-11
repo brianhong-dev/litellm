@@ -1,4 +1,4 @@
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from types import MappingProxyType
 from typing import (
     TYPE_CHECKING,
@@ -22,6 +22,7 @@ from litellm.litellm_core_utils.core_helpers import (
     require_attributes,
 )
 from litellm.proxy._types import CommonProxyErrors, UserAPIKeyAuth
+from litellm.proxy.auth.auth_checks import assert_allowed_without_access_groups
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
 from litellm.proxy.common_utils.http_parsing_utils import read_raw_json_body
@@ -30,7 +31,9 @@ from litellm.proxy.utils import jsonify_object
 from litellm.proxy.vector_store_endpoints.utils import (
     assert_proxy_admin_for_vector_store_index_management,
     assert_user_can_access_vector_store,
+    assert_user_can_read_vector_store,
     get_litellm_managed_vector_store,
+    vector_store_search_gate,
     with_managed_search_file_ids,
 )
 from litellm.repositories.table_repositories import ManagedVectorStoreIndexRepository
@@ -122,6 +125,8 @@ async def _update_request_data_with_litellm_managed_vector_store_registry(
     data: dict,
     vector_store_id: str,
     user_api_key_dict: UserAPIKeyAuth | None = None,
+    *,
+    authorize: Callable[[LiteLLM_ManagedVectorStore, UserAPIKeyAuth], Awaitable[None]],
 ) -> dict:
     """
     Update the request data with the litellm managed vector store registry.
@@ -130,6 +135,7 @@ async def _update_request_data_with_litellm_managed_vector_store_registry(
         data: Request data to update
         vector_store_id: ID of the vector store
         user_api_key_dict: User API key authentication info for access control
+        authorize: Refuses a caller who may not run this request on the vector store
 
     Raises:
         HTTPException: If user doesn't have access to the vector store
@@ -140,10 +146,7 @@ async def _update_request_data_with_litellm_managed_vector_store_registry(
     if vector_store_to_run is None:
         return data
     if user_api_key_dict is not None:
-        await assert_user_can_access_vector_store(
-            vector_store=vector_store_to_run,
-            user_api_key_dict=user_api_key_dict,
-        )
+        await authorize(vector_store_to_run, user_api_key_dict)
     return {**data, **build_request_data_from_managed_vector_store(vector_store_to_run)}
 
 
@@ -191,7 +194,10 @@ async def vector_store_search(
     data = dict(  # rebind-ok: pre-existing rebinding of the request body
         with_caller_query_params(
             await _update_request_data_with_litellm_managed_vector_store_registry(
-                data=data, vector_store_id=vector_store_id, user_api_key_dict=user_api_key_dict
+                data=data,
+                vector_store_id=vector_store_id,
+                user_api_key_dict=user_api_key_dict,
+                authorize=vector_store_search_gate(caller_body, request),
             ),
             caller_body.get("extra_body"),
         )
@@ -387,7 +393,10 @@ async def vector_store_retrieve(
     data = {"vector_store_id": vector_store_id}
 
     data = await _update_request_data_with_litellm_managed_vector_store_registry(
-        data=data, vector_store_id=vector_store_id, user_api_key_dict=user_api_key_dict
+        data=data,
+        vector_store_id=vector_store_id,
+        user_api_key_dict=user_api_key_dict,
+        authorize=assert_user_can_read_vector_store,
     )
 
     processor: Final = ProxyBaseLLMRequestProcessing(data=data)
@@ -525,8 +534,12 @@ async def vector_store_update(
         await read_raw_json_body(request), VectorStoreWriteBody.model_validate(data)
     )
 
+    assert_allowed_without_access_groups(request)
     data = await _update_request_data_with_litellm_managed_vector_store_registry(
-        data=data, vector_store_id=vector_store_id, user_api_key_dict=user_api_key_dict
+        data=data,
+        vector_store_id=vector_store_id,
+        user_api_key_dict=user_api_key_dict,
+        authorize=assert_user_can_access_vector_store,
     )
 
     processor: Final = ProxyBaseLLMRequestProcessing(data=data)
@@ -588,8 +601,12 @@ async def vector_store_delete(
 
     data = {"vector_store_id": vector_store_id}
 
+    assert_allowed_without_access_groups(request)
     data = await _update_request_data_with_litellm_managed_vector_store_registry(
-        data=data, vector_store_id=vector_store_id, user_api_key_dict=user_api_key_dict
+        data=data,
+        vector_store_id=vector_store_id,
+        user_api_key_dict=user_api_key_dict,
+        authorize=assert_user_can_access_vector_store,
     )
 
     processor: Final = ProxyBaseLLMRequestProcessing(data=data)
