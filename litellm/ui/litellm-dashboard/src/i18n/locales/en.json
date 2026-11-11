@@ -9321,6 +9321,7 @@
       "toolsLoadFailed": "Could not load tools for {{serverName}}",
       "empty": {
         "connectMode": "No MCP servers are available to this connection yet. Ask an admin to grant your user or team access.",
+        "loadFailed": "Could not load your MCP servers. Reload the page to try again.",
         "noServers": "No MCP servers configured. Add servers in Tools -> MCP Servers.",
         "noneConnected": "No servers connected yet.",
         "noMatch": "No servers match your search."
@@ -9376,7 +9377,8 @@
       "connectServer": "Connect {{server}}",
       "finish": "Finish connecting",
       "cancel": "Cancel",
-      "manualDelivery": "My client is on a remote or SSH machine"
+      "manualDelivery": "My client is on a remote or SSH machine",
+      "tooManyPicks": "Turn off some servers to finish. One connection can include at most {{max}}."
     },
     "keysPanel": {
       "relativeTime": {

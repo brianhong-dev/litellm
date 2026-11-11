@@ -96,7 +96,7 @@ interface Props {
   selectedServers: string[];
   onChange: (servers: string[]) => void;
   connectMode?: boolean;
-  /** Reported only once the list has loaded. */
+  /** Not reported until every server's state is known, nor after a failed load. */
   onConnectedServerIds?: (serverIds: string[]) => void;
 }
 
@@ -135,6 +135,7 @@ const MCPAppsPanel: React.FC<Props> = ({
   const { t } = useTranslation();
   const [servers, setServers] = useState<MCPServer[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadFailed, setLoadFailed] = useState(false);
   const [query, setQuery] = useState("");
   const [activeTab, setActiveTab] = useState<TabKey>("all");
   const [togglingOn, setTogglingOn] = useState<Set<string>>(new Set());
@@ -198,6 +199,10 @@ const MCPAppsPanel: React.FC<Props> = ({
         if (!isCurrentLoad()) return;
         if (status.has_credential && !status.is_expired) {
           setOauthConnected((prev) => new Set(prev).add(server.server_id));
+          if (!selectedServersRef.current.includes(nameOf(server)) && connectUnavailabilityLabel(server) === null) {
+            selectedServersRef.current = [...selectedServersRef.current, nameOf(server)];
+            onChangeRef.current(selectedServersRef.current);
+          }
         }
       } catch {
         // ignore
@@ -211,7 +216,7 @@ const MCPAppsPanel: React.FC<Props> = ({
         }
       }
     },
-    [accessToken],
+    [accessToken, connectUnavailabilityLabel],
   );
 
   useEffect(() => {
@@ -243,6 +248,7 @@ const MCPAppsPanel: React.FC<Props> = ({
       .catch(() => {
         if (isCurrentLoad()) {
           commitServers([]);
+          setLoadFailed(true);
           setLoading(false);
         }
       });
@@ -361,11 +367,13 @@ const MCPAppsPanel: React.FC<Props> = ({
     [servers, selectedServers, connectUnavailabilityLabel],
   );
   const connectedCount = connectedServerIds.length;
+  const selectionKnown = !loading && !loadFailed && oauthChecking.size === 0;
   useEffect(() => {
-    if (!loading) onConnectedServerIds?.(connectedServerIds);
-  }, [loading, connectedServerIds, onConnectedServerIds]);
+    if (selectionKnown) onConnectedServerIds?.(connectedServerIds);
+  }, [selectionKnown, connectedServerIds, onConnectedServerIds]);
 
   const emptyStateText = () => {
+    if (loadFailed) return t("chat.mcpAppsPanel.empty.loadFailed");
     if (servers.length === 0) {
       return connectMode ? t("chat.mcpAppsPanel.empty.connectMode") : t("chat.mcpAppsPanel.empty.noServers");
     }

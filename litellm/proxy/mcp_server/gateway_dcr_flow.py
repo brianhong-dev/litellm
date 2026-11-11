@@ -1304,11 +1304,9 @@ async def _narrowed_to_selection(
     upstream_ids: Final = tuple(item.server_id for item in flow.upstream_scopes)
     granted: Final = tuple(dict.fromkeys((*upstream_ids, *reachable_ids, *m2m_ids)))
     if not _session_tokens_fit(flow, granted, master_key):
-        verbose_logger.warning(
-            "connect flow picks span %d servers, too many for a session token; granting every reachable server",
-            len(granted),
+        return _oauth_error(
+            400, "invalid_request", "too many MCP servers are turned on for one connection; turn some off and try again"
         )
-        return flow
     return flow.model_copy(update={"resource_server_ids": granted})
 
 

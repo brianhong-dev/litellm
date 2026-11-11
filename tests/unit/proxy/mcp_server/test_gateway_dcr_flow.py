@@ -3693,22 +3693,26 @@ def _fleet_server(index: int, m2m: bool = False) -> MCPServer:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("picked_count", "m2m_count"), [(80, 0), (1, 100)], ids=["many-picks", "one-pick-many-m2m"])
-async def test_picks_too_many_for_a_session_token_keep_every_server(picked_count: int, m2m_count: int) -> None:
+async def test_picks_too_many_for_a_session_token_are_refused(picked_count: int, m2m_count: int) -> None:
     picked: Final = tuple(_fleet_server(index) for index in range(picked_count))
     m2m: Final = tuple(_fleet_server(picked_count + index, m2m=True) for index in range(m2m_count))
-    client_id, completed = await _complete_with_selection(tuple(server.server_id for server in picked), (*picked, *m2m))
-    assert completed.status_code == 303
-    code, sealed = _sealed_code_from(completed)
-    assert sealed.get("resource_server_ids") is None
-    assert await _session_servers(code, client_id) is None
+    _, completed = await _complete_with_selection(tuple(server.server_id for server in picked), (*picked, *m2m))
+    assert completed.status_code == 400
+    assert json.loads(completed.body)["error_description"] == (
+        "too many MCP servers are turned on for one connection; turn some off and try again"
+    )
 
 
 @pytest.mark.asyncio
 async def test_every_narrowed_grant_near_the_size_cap_refreshes() -> None:
     fleet: Final = tuple(_fleet_server(index) for index in range(80))
+    outcomes: Final[list[int]] = []
     for picked_count in range(50, 80):
         picked = fleet[:picked_count]
         client_id, completed = await _complete_with_selection(tuple(server.server_id for server in picked), picked)
+        outcomes.append(completed.status_code)
+        if completed.status_code == 400:
+            continue
         code, _ = _sealed_code_from(completed)
         cache = DualCache()
         redeemed = await _redeem(code, client_id, cache=cache, resource="https://llm.example.com/mcp")
@@ -3722,6 +3726,9 @@ async def test_every_narrowed_grant_near_the_size_cap_refreshes() -> None:
             resource="https://llm.example.com/mcp",
         )
         assert rotated.status_code == 200, picked_count
+    assert outcomes == sorted(outcomes, key=lambda status: status == 400)
+    assert 303 in outcomes
+    assert 400 in outcomes
 
 
 @pytest.mark.asyncio

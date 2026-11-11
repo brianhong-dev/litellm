@@ -66,10 +66,13 @@ describe("ConnectFlowBanner", () => {
     expect(screen.getByRole("button", { name: /finish connecting/i })).toBeDisabled();
   });
 
-  it("posts no picks once they would pass the gateway's form field limit", () => {
+  it("holds Finish and says why once picks would pass the gateway's form field limit", () => {
+    const tooMany = /turn off some servers to finish/i;
     const fits = Array.from({ length: 997 }, (_, i) => `server-${i}`);
     const { rerender } = renderBanner("https://claude.ai", fits);
     expect(screen.queryAllByDisplayValue(/^server-\d+$/)).toHaveLength(997);
+    expect(screen.getByRole("button", { name: /finish connecting/i })).toBeEnabled();
+    expect(screen.queryByText(tooMany)).not.toBeInTheDocument();
 
     rerender(
       <ConnectFlowBanner
@@ -81,8 +84,8 @@ describe("ConnectFlowBanner", () => {
         connectedServerIds={[...fits, "server-997"]}
       />,
     );
-    expect(screen.queryAllByDisplayValue(/^server-\d+$/)).toHaveLength(0);
-    expect(screen.getByDisplayValue("flow-handle-123")).toHaveAttribute("name", "flow");
+    expect(screen.getByRole("button", { name: /finish connecting/i })).toBeDisabled();
+    expect(screen.getByText(tooMany)).toHaveTextContent("at most 997");
   });
 
   it("lists multi-server consent and requires every server before finishing", () => {

@@ -8,7 +8,7 @@ import { getProxyBaseUrl, ConnectFlowStatus } from "@/components/networking";
 import { OAuth2ConnectButton } from "@/components/chat/MCPAppsPanel";
 import i18n from "@/i18n/i18n";
 
-// More would pass the gateway's form field limit; posting none keeps the unscoped grant.
+// The gateway's form field limit, less the flow, decision and delivery fields.
 const MAX_POSTED_PICKS = 997;
 
 interface Props {
@@ -17,7 +17,7 @@ interface Props {
   accessToken: string;
   onConnected: () => void;
   failed: boolean;
-  /** null until the page has loaded its servers. */
+  /** null until the page knows which servers are on. */
   connectedServerIds?: string[] | null;
 }
 
@@ -106,8 +106,9 @@ const ConnectFlowBanner: React.FC<Props> = ({
   const action = `${getProxyBaseUrl()}/authorize/complete`;
   const state = failed || flow === undefined ? "stale" : flow.state;
   const canFinish = canFinishConnectFlow(state, flow);
-  const fitsTheForm = connectedServerIds !== null && connectedServerIds.length <= MAX_POSTED_PICKS;
-  const postedServerIds = state === "unscoped" && fitsTheForm ? connectedServerIds : [];
+  const tooManyPicks = connectedServerIds !== null && connectedServerIds.length > MAX_POSTED_PICKS;
+  const picksReady = connectedServerIds !== null && !tooManyPicks;
+  const postedServerIds = state === "unscoped" && picksReady ? connectedServerIds : [];
   const canCancel = state !== "unscoped";
   const loopbackClient = isLoopbackOrigin(flow?.client_origin ?? null);
   const vendorServers = vendorServersFor(state, flow);
@@ -121,6 +122,11 @@ const ConnectFlowBanner: React.FC<Props> = ({
           <div className="min-w-0">
             <p className="text-sm font-semibold text-foreground">{copy[0]}</p>
             <p className="text-[13px] text-muted-foreground mt-0.5">{copy[1]}</p>
+            {state === "unscoped" && tooManyPicks && (
+              <p className="text-[13px] text-destructive mt-1">
+                {t("chat.connectFlowBanner.tooManyPicks", { max: MAX_POSTED_PICKS })}
+              </p>
+            )}
           </div>
         </div>
         <div className="flex shrink-0 gap-2">
@@ -150,7 +156,7 @@ const ConnectFlowBanner: React.FC<Props> = ({
             {canFinish && (
               <button
                 type="submit"
-                disabled={state === "unscoped" && connectedServerIds === null}
+                disabled={state === "unscoped" && !picksReady}
                 className="h-[38px] rounded-md bg-primary px-4 text-sm font-semibold text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
               >
                 {t("chat.connectFlowBanner.finish")}
