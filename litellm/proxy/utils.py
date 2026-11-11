@@ -32,7 +32,6 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formatdate
 from functools import partial, reduce
-from itertools import takewhile
 from operator import attrgetter
 from types import MappingProxyType
 from typing import (
@@ -158,7 +157,9 @@ from litellm.integrations.custom_guardrail import (
     ModifyResponseException,
     merged_guardrail_entries,
 )
-from litellm.integrations.custom_logger import CustomLogger
+from litellm.integrations.custom_logger import CustomLogger, overrides_hook
+from litellm.integrations.custom_logger_v2.enums import Hook
+from litellm.integrations.custom_logger_v2.host import run_legacy_hook
 from litellm.integrations.prometheus import PrometheusLogger
 from litellm.integrations.SlackAlerting.slack_alerting import SlackAlerting
 from litellm.integrations.SlackAlerting.utils import add_langfuse_trace_id_to_alert
@@ -1891,9 +1892,14 @@ class _CallbackCapabilities:
     listed_models_filters: tuple[CustomLogger, ...] = field(default_factory=tuple)
 
 
-def _overrides_hook(callback: CustomLogger, hook_name: str) -> bool:
-    leaf_to_base: Final = takewhile(lambda klass: klass is not CustomLogger, type(callback).__mro__)
-    return any(hook_name in klass.__dict__ for klass in leaf_to_base)
+def _overrides_hook(callback: object, hook_name: str) -> bool:
+    return overrides_hook(type(callback), hook_name)
+
+
+def routes_through_apply_guardrail(callback: CustomGuardrail) -> bool:
+    return overrides_hook(type(callback), "apply_guardrail", CustomGuardrail) and not getattr(
+        callback, "use_native_lifecycle_hooks", False
+    )
 
 
 def _overrides_moderation_hook(callback: CustomLogger) -> bool:
@@ -2632,9 +2638,7 @@ class ProxyLogging:
             Result from the guardrail execution
         """
         # Use unified_guardrail if callback has apply_guardrail method
-        has_apply_guardrail: Final = "apply_guardrail" in type(callback).__dict__ and not getattr(
-            callback, "use_native_lifecycle_hooks", False
-        )
+        has_apply_guardrail: Final = routes_through_apply_guardrail(callback)
         use_unified: Final = has_apply_guardrail and not (
             hook_type == "during_call" and getattr(callback, "use_native_during_call_hook", False)
         )
@@ -3290,6 +3294,30 @@ class ProxyLogging:
             independent_snapshot(data) if needs_raw_request_snapshot else None
         )
 
+        return await run_legacy_hook(
+            Hook.pre_call,
+            lambda _patches: self._legacy_pre_call(
+                request_data=data,
+                user_api_key_dict=user_api_key_dict,
+                call_type=call_type,
+                guardrails_only=guardrails_only,
+                skip_guardrails=skip_guardrails,
+                endpoint_type=endpoint_type,
+                raw_request_snapshot=raw_request_snapshot,
+            ),
+        )
+
+    async def _legacy_pre_call(
+        self,
+        request_data: dict[str, object],  # mutable-ok: same request-payload shape as pre_call_hook's data
+        user_api_key_dict: UserAPIKeyAuth,
+        call_type: CallTypesLiteral,
+        guardrails_only: bool,
+        skip_guardrails: bool,
+        endpoint_type: EndpointType,
+        raw_request_snapshot: dict[str, object] | None,  # mutable-ok: same request-payload shape as data
+    ) -> dict[str, object] | None:  # mutable-ok: same request-payload shape as data
+        data: dict[str, object] | None = request_data  # rebind-ok: hooks replace it  # mutable-ok: request dict
         try:
             if not skip_guardrails:
                 data, _ = await self._maybe_execute_pipelines(  # rebind-ok: pipeline edits feed the callback loop below
@@ -3359,8 +3387,7 @@ class ProxyLogging:
                         _callback is not None
                         and isinstance(_callback, CustomLogger)
                         and (not guardrails_only or _callback.enforces_request_content)
-                        and "async_pre_call_hook" in vars(_callback.__class__)
-                        and _callback.__class__.async_pre_call_hook != CustomLogger.async_pre_call_hook
+                        and _overrides_hook(_callback, "async_pre_call_hook")
                     ):
                         if call_type in MCP_GUARDRAIL_CALL_TYPES and user_api_key_dict is None:
                             continue
@@ -3409,7 +3436,9 @@ class ProxyLogging:
                     )
 
             if deferred_route_exc is not None and data is not None:
-                data = await self._handle_sensitive_data_route_exception(deferred_route_exc, data, user_api_key_dict)
+                data = await self._handle_sensitive_data_route_exception(  # rebind-ok: the reroute replaces the request
+                    deferred_route_exc, data, user_api_key_dict
+                )
 
             if parallel_guardrails and data is not None:
                 await self._run_parallel_pre_call_guardrails(
@@ -3425,7 +3454,9 @@ class ProxyLogging:
 
             return data
         except SensitiveDataRouteException as e:
-            data = await self._handle_sensitive_data_route_exception(e, data, user_api_key_dict)
+            data = await self._handle_sensitive_data_route_exception(  # rebind-ok: the reroute replaces the request
+                e, data, user_api_key_dict
+            )
             if data is not None:
                 self._process_guardrail_metadata(data, skip_guardrails=skip_guardrails)
             return data
@@ -3687,38 +3718,16 @@ class ProxyLogging:
                 has_guardrail = True
             elif _overrides_moderation_hook(resolved):
                 has_moderation_override = True
-            # Use the same leaf-class ``__dict__`` check as the other hook
-            # capabilities: only callbacks that actually override the hook
-            # contribute to the flag. Setting this for every ``CustomLogger``
-            # instance (the prior behaviour) forced the full
-            # ``post_call_response_headers_hook`` body to run on every request
-            # even when no registered callback customized response headers.
-            cls_attrs = cls.__dict__
-            if "async_post_call_response_headers_hook" in cls_attrs:
+            if _overrides_hook(resolved, "async_post_call_response_headers_hook"):
                 has_post_call_response_headers = True
-            if "async_post_call_streaming_iterator_hook" in cls_attrs:
+            if _overrides_hook(resolved, "async_post_call_streaming_iterator_hook"):
                 has_iterator_override = True
                 iterator_overrides.append((resolved, "override"))
-            elif "apply_guardrail" in cls_attrs and not getattr(resolved, "use_native_lifecycle_hooks", False):
+            elif isinstance(resolved, CustomGuardrail) and routes_through_apply_guardrail(resolved):
                 iterator_overrides.append((resolved, "apply_guardrail"))
-            # Walk the MRO for ``async_post_call_streaming_hook`` rather than
-            # using the leaf-class ``__dict__`` check used by the other flags:
-            # before this PR the hook was unconditionally invoked, so a
-            # callback that inherits an override from an intermediate parent
-            # (e.g. a vendor base class providing the override, with the
-            # registered class adding nothing else) MUST still be detected.
-            # A leaf-class miss here would silently drop the inherited hook.
-            base_streaming_hook = CustomLogger.async_post_call_streaming_hook
-            cls_streaming_hook = getattr(
-                cls,
-                "async_post_call_streaming_hook",
-                base_streaming_hook,
-            )
-            if getattr(cls_streaming_hook, "__func__", cls_streaming_hook) is not getattr(
-                base_streaming_hook, "__func__", base_streaming_hook
-            ):
+            if _overrides_hook(resolved, "async_post_call_streaming_hook"):
                 has_streaming_chunk_override = True
-            if "async_pre_call_hook" in cls_attrs:
+            if _overrides_hook(resolved, "async_pre_call_hook"):
                 has_pre_call_override = True
                 if resolved.enforces_request_content is True:
                     has_content_enforcer = True
@@ -3799,6 +3808,23 @@ class ProxyLogging:
         call_type: CallTypesLiteral,
         guardrails_only: bool = False,
     ):
+        return await run_legacy_hook(
+            Hook.during_call,
+            lambda _patches: self._legacy_during_call(
+                data=data,
+                user_api_key_dict=user_api_key_dict,
+                call_type=call_type,
+                guardrails_only=guardrails_only,
+            ),
+        )
+
+    async def _legacy_during_call(
+        self,
+        data: dict[str, object],  # mutable-ok: same request-payload shape as during_call_hook's data
+        user_api_key_dict: UserAPIKeyAuth | None,
+        call_type: CallTypesLiteral,
+        guardrails_only: bool,
+    ) -> dict[str, object]:  # mutable-ok: the request payload is handed back unchanged
         caps: Final = ProxyLogging.callback_capabilities()
         if not caps.has_guardrail and not caps.has_moderation_override:
             return data
@@ -3873,8 +3899,7 @@ class ProxyLogging:
         call_type: CallTypesLiteral,
     ) -> None:
         if (
-            "apply_guardrail" in type(callback).__dict__
-            and not callback.use_native_lifecycle_hooks
+            routes_through_apply_guardrail(callback)
             and user_api_key_dict is not None
             and not callback.use_native_during_call_hook
         ):
@@ -4165,6 +4190,23 @@ class ProxyLogging:
 
         redacted_traceback_str: Final = redact_string(traceback_str) if traceback_str is not None else None
 
+        return await run_legacy_hook(
+            Hook.post_call_failure,
+            lambda _patches: self._legacy_post_call_failure(
+                request_data=request_data,
+                original_exception=original_exception,
+                user_api_key_dict=user_api_key_dict,
+                redacted_traceback_str=redacted_traceback_str,
+            ),
+        )
+
+    async def _legacy_post_call_failure(
+        self,
+        request_data: dict[str, object],  # mutable-ok: same request-payload shape as post_call_failure_hook's
+        original_exception: Exception,
+        user_api_key_dict: UserAPIKeyAuth,
+        redacted_traceback_str: str | None,
+    ) -> HTTPException | None:
         # Track the first HTTPException returned or raised by any callback
         transformed_exception: HTTPException | None = None
 
@@ -4437,6 +4479,21 @@ class ProxyLogging:
         4. /files
         """
 
+        return await run_legacy_hook(
+            Hook.post_call_success,
+            lambda _patches: self._legacy_post_call_success(
+                data=data,
+                response=response,
+                user_api_key_dict=user_api_key_dict,
+            ),
+        )
+
+    async def _legacy_post_call_success(
+        self,
+        data: dict[str, object],  # mutable-ok: same request-payload shape as post_call_success_hook's data
+        response: LLMResponseTypes,
+        user_api_key_dict: UserAPIKeyAuth,
+    ) -> LLMResponseTypes:
         from litellm.proxy.proxy_server import llm_router
         from litellm.types.guardrails import GuardrailEventHooks
 
@@ -4485,7 +4542,7 @@ class ProxyLogging:
 
                 guardrail_response: Any | None = None
 
-                if "apply_guardrail" in type(callback).__dict__ and not callback.use_native_lifecycle_hooks:
+                if routes_through_apply_guardrail(callback):
                     data["guardrail_to_apply"] = callback
                     guardrail_response = await self._run_guardrail_with_metrics(
                         callback,
@@ -4525,6 +4582,8 @@ class ProxyLogging:
             #################################################################
 
             for callback in other_callbacks:
+                if not _overrides_hook(callback, "async_post_call_success_hook"):
+                    continue
                 callback_response: LLMResponseTypes | None = await callback.async_post_call_success_hook(
                     user_api_key_dict=user_api_key_dict, data=data, response=response
                 )
@@ -4563,7 +4622,7 @@ class ProxyLogging:
                 return
             if callback.post_call_already_checked(request_view, response) is True:
                 return
-            if "apply_guardrail" in type(callback).__dict__ and not callback.use_native_lifecycle_hooks:
+            if routes_through_apply_guardrail(callback):
                 data["guardrail_to_apply"] = callback
                 await self._run_guardrail_with_metrics(
                     callback,
@@ -4619,6 +4678,21 @@ class ProxyLogging:
         (matching the inbound ``pre_mcp_call`` behavior) rather than being
         swallowed into an unguarded result.
         """
+        return await run_legacy_hook(
+            Hook.mcp_tool_result,
+            lambda _patches: self._legacy_post_mcp_call(
+                response=response,
+                request_data=request_data,
+                user_api_key_dict=user_api_key_dict,
+            ),
+        )
+
+    async def _legacy_post_mcp_call(
+        self,
+        response: "CallToolResult",
+        request_data: Mapping[str, Any],
+        user_api_key_dict: UserAPIKeyAuth | None,
+    ) -> "CallToolResult":
         caps: Final = ProxyLogging.callback_capabilities()
         if not caps.has_guardrail:
             return response
@@ -4631,7 +4705,7 @@ class ProxyLogging:
         for callback in caps.resolved_callbacks:
             if not isinstance(callback, CustomGuardrail):
                 continue
-            if "apply_guardrail" not in type(callback).__dict__ or callback.use_native_lifecycle_hooks:
+            if not routes_through_apply_guardrail(callback):
                 continue
             if (
                 callback.should_run_guardrail(data=request_data, event_type=GuardrailEventHooks.post_mcp_call)
@@ -4666,6 +4740,23 @@ class ProxyLogging:
         Returns:
             Dict[str, str]: Merged headers from all callbacks.
         """
+        return await run_legacy_hook(
+            Hook.response_headers,
+            lambda _patches: self._legacy_response_headers(
+                data=data,
+                user_api_key_dict=user_api_key_dict,
+                response=response,
+                request_headers=request_headers,
+            ),
+        )
+
+    async def _legacy_response_headers(
+        self,
+        data: dict[str, object],  # mutable-ok: same request-payload shape as post_call_response_headers_hook's
+        user_api_key_dict: UserAPIKeyAuth,
+        response: object,
+        request_headers: dict[str, str] | None,  # mutable-ok: same shape as post_call_response_headers_hook's
+    ) -> dict[str, str]:  # mutable-ok: same merged-headers shape as post_call_response_headers_hook
         merged_headers: Final[dict[str, str]] = {}
         # Outer call sites in common_request_processing.py already gate this
         # call with ``has_post_call_response_headers_callbacks()``. The
@@ -4688,7 +4779,11 @@ class ProxyLogging:
                 else:
                     _callback = callback
 
-                if _callback is not None and isinstance(_callback, CustomLogger):
+                if (
+                    _callback is not None
+                    and isinstance(_callback, CustomLogger)
+                    and _overrides_hook(_callback, "async_post_call_response_headers_hook")
+                ):
                     if _accepts_litellm_call_info(_callback):
                         result = await _callback.async_post_call_response_headers_hook(
                             data=data,
@@ -4712,6 +4807,17 @@ class ProxyLogging:
         return merged_headers
 
     async def hidden_by_listing_callbacks(
+        self, user_api_key_dict: UserAPIKeyAuth, model_names: Sequence[str]
+    ) -> frozenset[str]:
+        return await run_legacy_hook(
+            Hook.list_models,
+            lambda _patches: self._legacy_hidden_by_listing_callbacks(
+                user_api_key_dict=user_api_key_dict,
+                model_names=model_names,
+            ),
+        )
+
+    async def _legacy_hidden_by_listing_callbacks(
         self, user_api_key_dict: UserAPIKeyAuth, model_names: Sequence[str]
     ) -> frozenset[str]:
         filters: Final = ProxyLogging.callback_capabilities().listed_models_filters
