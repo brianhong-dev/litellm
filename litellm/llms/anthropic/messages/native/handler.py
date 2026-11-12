@@ -387,7 +387,7 @@ async def _execute_pre_request_hooks(
             pass
 
     # Build complete request kwargs dict
-    request_kwargs = {
+    request_kwargs: dict[str, object] = {  # mutable-ok: the hooks take and may replace the request dict
         "tools": tools,
         "stream": stream,
         "litellm_params": {
@@ -427,7 +427,10 @@ async def _execute_pre_request_hooks(
 
 
 def _start_pre_request_hook(
-    model: str, messages: list[dict], callback: object, request_kwargs: object
+    model: str,
+    messages: list[dict[str, object]],  # mutable-ok: the hook takes the messages list
+    callback: object,
+    request_kwargs: object,
 ) -> Awaitable[Patch | None] | None:
     if not isinstance(callback, CustomLogger):
         return None
@@ -435,10 +438,13 @@ def _start_pre_request_hook(
 
 
 async def _pre_request_hook(
-    callback: CustomLogger, model: str, messages: list[dict], request_kwargs: object
+    callback: CustomLogger,
+    model: str,
+    messages: list[dict[str, object]],  # mutable-ok: see above
+    request_kwargs: object,
 ) -> Patch | None:
-    modified_kwargs: Final = await callback.async_pre_request_hook(model, messages, request_kwargs)  # pyright: ignore[reportArgumentType]  # the request dict as the previous hook left it
-    return None if modified_kwargs is None else kwargs_patch(request_kwargs, modified_kwargs)
+    modified_kwargs: Final = await callback.async_pre_request_hook(model, messages, request_kwargs)  # pyright: ignore[reportArgumentType, reportUnknownMemberType, reportUnknownVariableType]  # the request dict as the previous hook left it
+    return None if modified_kwargs is None else kwargs_patch(request_kwargs, modified_kwargs)  # pyright: ignore[reportUnknownArgumentType]  # see above
 
 
 async def _try_websearch_short_circuit(

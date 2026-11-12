@@ -133,21 +133,6 @@ from litellm.rust_bridge.configuration import Decision
 _CachingHandlerResponse = None
 _LLMCachingHandler = None
 _CustomGuardrail = None
-_CustomLogger = None
-
-
-def _get_cached_custom_logger():
-    """
-    Get cached CustomLogger class.
-    Lazy imports on first call to avoid loading custom_logger at import time.
-    Subsequent calls use cached class for better performance.
-    """
-    global _CustomLogger
-    if _CustomLogger is None:
-        from litellm.integrations.custom_logger import CustomLogger
-
-        _CustomLogger = CustomLogger
-    return _CustomLogger
 
 
 @lru_cache(maxsize=None)
@@ -1839,7 +1824,7 @@ def _deployment_provider(kwargs: Mapping[str, object]) -> str:
 
 async def async_pre_call_deployment_hook(
     kwargs: Mapping[str, object], call_type: str, *, natives: bool = False
-) -> dict[str, Any]:
+) -> dict[str, Any]:  # mutable-ok: callers merge the returned kwargs
     """
     Allow modifying the request just before it's sent to the deployment.
 
@@ -1866,7 +1851,7 @@ async def async_pre_call_deployment_hook(
         and Hook.pre_deployment_call in CustomLoggerV2.declared_hooks
         and (line := hook_line(Hook.pre_deployment_call, callbacks, admit=Admit.every_logger)).has_natives
     ):
-        modified_kwargs = kwargs_after(
+        modified_kwargs = kwargs_after(  # rebind-ok: whatever the last hook returned
             await run_line(
                 line, KwargsFields(modified_kwargs, PROXY_REQUEST_KEYS), partial(_start_pre_deployment, typed_call_type)
             )
@@ -1878,7 +1863,7 @@ async def async_pre_call_deployment_hook(
                 if result is not None:
                     modified_kwargs = result
 
-    return _unstreamed_when_post_call_guardrails_apply(modified_kwargs, typed_call_type)
+    return _unstreamed_when_post_call_guardrails_apply(modified_kwargs, typed_call_type)  # pyright: ignore[reportArgumentType]  # whatever the last hook returned, as before
 
 
 def _start_pre_deployment(
@@ -1890,8 +1875,8 @@ def _start_pre_deployment(
 
 
 async def _pre_deployment(callback: CustomLogger, kwargs: object, call_type: CallTypes | None) -> Patch | None:
-    result: Final = await callback.async_pre_call_deployment_hook(kwargs, call_type)  # pyright: ignore[reportArgumentType]  # the request dict as the previous hook left it
-    return None if result is None else kwargs_patch(kwargs, result)
+    result: Final = await callback.async_pre_call_deployment_hook(kwargs, call_type)  # pyright: ignore[reportArgumentType, reportUnknownMemberType, reportUnknownVariableType]  # the request dict as the previous hook left it
+    return None if result is None else kwargs_patch(kwargs, result)  # pyright: ignore[reportUnknownArgumentType]  # see above
 
 
 def _unstreamed_when_post_call_guardrails_apply(
@@ -1916,7 +1901,11 @@ def _unstreamed_when_post_call_guardrails_apply(
 
 
 async def async_post_call_success_deployment_hook(
-    request_data: dict, response: object, call_type: CallTypes | None, *, natives: bool = False
+    request_data: dict,  # mutable-ok: the attempt's request dict the hooks receive
+    response: object,
+    call_type: CallTypes | None,
+    *,
+    natives: bool = False,
 ) -> object:
     """
     Allow modifying / reviewing the response just after it's received from the deployment.
@@ -1932,11 +1921,11 @@ async def async_post_call_success_deployment_hook(
         and Hook.post_deployment_success in CustomLoggerV2.declared_hooks
         and (line := hook_line(Hook.post_deployment_success, callbacks, admit=Admit.every_logger)).has_natives
     ):
-        fields: Final = ResultFields(request_data, PROXY_REQUEST_KEYS, Field.response, response)
+        fields: Final = ResultFields(request_data, PROXY_REQUEST_KEYS, Field.response, response)  # pyright: ignore[reportUnknownArgumentType]  # the attempt's request dict
         _ = kwargs_after(await run_line(line, fields, partial(_start_post_deployment_success, fields, typed_call_type)))
         return fields.value
 
-    modified_response = response
+    modified_response = response  # rebind-ok: each hook may replace it
     for callback in callbacks:
         if isinstance(callback, CustomLogger):
             result = await _post_deployment_success(callback, request_data, modified_response, typed_call_type)

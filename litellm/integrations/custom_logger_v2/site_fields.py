@@ -27,7 +27,7 @@ class CandidateFields(LiveFields):
         if field is Field.model:
             return self._model
         if field is Field.candidate_deployments and isinstance(self._deployments, list | tuple):
-            return tuple(self._deployments)  # pyright: ignore[reportUnknownArgumentType]  # untyped deployment dicts
+            return tuple(self._deployments)  # pyright: ignore[reportUnknownArgumentType, reportUnknownMemberType, reportUnknownVariableType]  # untyped deployment dicts
         raise KeyError(field)
 
     def __iter__(self) -> Iterator[Field]:
@@ -85,7 +85,7 @@ class ResultFields(LiveFields):
     def apply(self, patch: Patch) -> Mapping[Field, object]:
         values: Final = tuple(_slot_value(op, self._slot) for op in patch.ops)
         if values:
-            self.value = values[-1]  # rebind-ok: the slot is the hook's live result
+            self.value = values[-1]
         return self
 
 

@@ -485,7 +485,8 @@ class OptionalChecks:
             and (line := hook_line(Hook.filter_deployments, callbacks, admit=Admit.every_logger)).has_natives
         ):
             filters: Final = partial(_start_filter, model, messages, request_kwargs)
-            remaining = kwargs_after(await run_line(line, CandidateFields(remaining, model), filters))
+            narrowed: Final = await run_line(line, CandidateFields(remaining, model), filters)
+            remaining = kwargs_after(narrowed)  # rebind-ok: narrowed by the line
         else:
             for callback in callbacks:
                 started = _filter_call(callback, model, messages, request_kwargs, remaining)
@@ -584,8 +585,12 @@ def _ids_of(value: object) -> Sequence[object]:
 
 
 def _filter_call(
-    callback: object, model: str, messages: object, request_kwargs: dict[str, object], remaining: object
-) -> Awaitable[object] | None:  # mutable-ok: the filters take the request dict
+    callback: object,
+    model: str,
+    messages: object,
+    request_kwargs: dict[str, object],  # mutable-ok: the filters take the request dict
+    remaining: object,
+) -> Awaitable[object] | None:
     if not isinstance(callback, CustomLogger) or not filters_deployments(callback):
         return None
     if isinstance(callback, PromptCachingDeploymentCheck):
@@ -600,8 +605,12 @@ def _filter_call(
 
 
 def _start_filter(
-    model: str, messages: object, request_kwargs: dict[str, object], callback: object, remaining: object
-) -> Awaitable[Patch | None] | None:  # mutable-ok: the filters take the request dict
+    model: str,
+    messages: object,
+    request_kwargs: dict[str, object],  # mutable-ok: the filters take the request dict
+    callback: object,
+    remaining: object,
+) -> Awaitable[Patch | None] | None:
     started: Final = _filter_call(callback, model, messages, request_kwargs, remaining)
     return None if started is None else _narrowed_by(remaining, started)
 

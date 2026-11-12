@@ -979,11 +979,19 @@ async def run_async_fallback(
     raise error_from_fallbacks
 
 
-async def log_success_fallback_event(original_model_group: str, kwargs: dict, original_exception: Exception):
+async def log_success_fallback_event(
+    original_model_group: str,
+    kwargs: dict,  # mutable-ok: the request kwargs the custom loggers receive
+    original_exception: Exception,
+):
     await _log_fallback_event(True, original_model_group, kwargs, original_exception)
 
 
-async def log_failure_fallback_event(original_model_group: str, kwargs: dict, original_exception: Exception):
+async def log_failure_fallback_event(
+    original_model_group: str,
+    kwargs: dict,  # mutable-ok: the request kwargs the custom loggers receive
+    original_exception: Exception,
+):
     await _log_fallback_event(False, original_model_group, kwargs, original_exception)
 
 
