@@ -11,6 +11,7 @@ Disable remote fetching entirely:
 import os
 import time
 import xml.etree.ElementTree as ET
+from collections.abc import Awaitable, Callable
 from email.utils import parsedate_to_datetime
 from importlib.resources import files
 from typing import Final
@@ -98,7 +99,7 @@ class GetBlogPosts:
         return response.text
 
     @staticmethod
-    def parse_rss_to_posts(xml_text: str, max_posts: int = BLOG_POSTS_MAX) -> tuple[BlogPost, ...]:
+    def parse_rss_to_posts(xml_text: str | bytes, max_posts: int = BLOG_POSTS_MAX) -> tuple[BlogPost, ...]:
         """
         Parse RSS XML into blog posts.
 
@@ -147,14 +148,40 @@ class GetBlogPosts:
                 url,
                 str(e),
             )
-            return cls.load_local_blog_posts()
+            return cls._cache_posts(cls.load_local_blog_posts())
 
         if not cls.validate_blog_posts(posts):
+            return cls._cache_posts(cls.load_local_blog_posts())
+
+        return cls._cache_posts(posts)
+
+    @classmethod
+    def _cache_posts(cls, posts: tuple[BlogPost, ...]) -> tuple[BlogPost, ...]:
+        cls._cached_posts = posts
+        cls._last_fetch_time = time.time()
+        return posts
+
+    @classmethod
+    async def aget_blog_posts(cls, url: str, fetch: Callable[[str], Awaitable[bytes]]) -> tuple[BlogPost, ...]:
+        if is_offline_mode() or os.getenv("LITELLM_LOCAL_BLOG_POSTS", "").lower() == "true":
             return cls.load_local_blog_posts()
 
-        cls._cached_posts = posts
-        cls._last_fetch_time = now
-        return posts
+        cached: Final = cls._cached_posts
+        if cached is not None and (time.time() - cls._last_fetch_time) < BLOG_POSTS_TTL_SECONDS:
+            return cached
+
+        try:
+            xml_text: Final = await fetch(url)
+            posts: Final = cls.parse_rss_to_posts(xml_text)
+        except (httpx.HTTPError, ET.ParseError, ValueError) as e:
+            verbose_logger.warning(
+                "LiteLLM: Failed to fetch blog posts from %s: %s. Falling back to local backup.", url, str(e)
+            )
+            return cls._cache_posts(cls.load_local_blog_posts())
+
+        if not cls.validate_blog_posts(posts):
+            return cls._cache_posts(cls.load_local_blog_posts())
+        return cls._cache_posts(posts)
 
 
 def get_blog_posts(url: str) -> tuple[BlogPost, ...]:
