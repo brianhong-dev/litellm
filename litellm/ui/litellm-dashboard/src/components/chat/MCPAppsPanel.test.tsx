@@ -234,6 +234,40 @@ describe("MCPAppsPanel connected-app reachability (LIT-4861)", () => {
     expect(onConnectedServerIds.mock.calls).toEqual([[["s-oauth", "s-reach"]]]);
   });
 
+  it("reports nothing while a Connect is still loading the server's tools", async () => {
+    vi.mocked(fetchMCPServers).mockResolvedValue(connectServers);
+    vi.mocked(listMCPTools).mockResolvedValue({ tools: [] });
+    const onConnectedServerIds = vi.fn();
+    const Page = () => {
+      const [selected, setSelected] = React.useState<string[]>([]);
+      return (
+        <MCPAppsPanel
+          accessToken="tok"
+          selectedServers={selected}
+          onChange={setSelected}
+          connectMode
+          onConnectedServerIds={onConnectedServerIds}
+        />
+      );
+    };
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <Page />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(await screen.findByText("reachable_srv"));
+    await waitFor(() => expect(onConnectedServerIds).toHaveBeenLastCalledWith([]));
+    let finishConnect: (result: { tools: never[] }) => void = () => {};
+    vi.mocked(listMCPTools).mockImplementationOnce(() => new Promise((resolve) => (finishConnect = resolve)));
+    fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+
+    await waitFor(() => expect(onConnectedServerIds).toHaveBeenLastCalledWith(null));
+    await act(async () => finishConnect({ tools: [] }));
+
+    expect(onConnectedServerIds).toHaveBeenLastCalledWith(["s-reach"]);
+  });
+
   it("requests the connected-app view and hides unreachable servers in connect mode", async () => {
     vi.mocked(fetchMCPServers).mockResolvedValue(connectServers);
     vi.mocked(listMCPTools).mockResolvedValue({ tools: [] });

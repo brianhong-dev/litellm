@@ -96,7 +96,7 @@ interface Props {
   selectedServers: string[];
   onChange: (servers: string[]) => void;
   connectMode?: boolean;
-  onConnectedServerIds?: (serverIds: string[]) => void;
+  onConnectedServerIds?: (serverIds: string[] | null) => void;
 }
 
 const AVATAR_COLORS = [
@@ -367,8 +367,9 @@ const MCPAppsPanel: React.FC<Props> = ({
   );
   const connectedCount = connectedServerIds.length;
   useEffect(() => {
-    if (!loading && !loadFailed && oauthChecking.size === 0) onConnectedServerIds?.(connectedServerIds);
-  }, [loading, loadFailed, oauthChecking.size, connectedServerIds, onConnectedServerIds]);
+    if (togglingOn.size > 0) onConnectedServerIds?.(null);
+    else if (!loading && !loadFailed && oauthChecking.size === 0) onConnectedServerIds?.(connectedServerIds);
+  }, [loading, loadFailed, oauthChecking.size, togglingOn.size, connectedServerIds, onConnectedServerIds]);
 
   const emptyStateText = () => {
     if (loadFailed) return t("chat.mcpAppsPanel.empty.loadFailed");
