@@ -6,6 +6,8 @@ from itertools import count
 from types import MappingProxyType
 from typing import Final, TypeAlias, TypeVar
 
+from typing_extensions import TypeIs  # noqa: TID251  # narrows the untyped legacy kwargs without copying them
+
 from litellm.integrations.custom_guardrail import CustomGuardrail
 from litellm.integrations.custom_logger import CustomLogger, overrides_hook
 from litellm.integrations.custom_logger_v2.call import CallFacts
@@ -87,7 +89,7 @@ def _derived_subscriptions(cls: type, guardrail: bool, parallel: bool) -> Mappin
 class LegacyLogger(CustomLoggerV2):
     def __init__(self, inner: CustomLogger) -> None:
         guardrail: Final = isinstance(inner, CustomGuardrail)
-        self.parallel: Final = guardrail and bool(getattr(inner, "run_in_parallel", False))
+        self.parallel = guardrail and bool(getattr(inner, "run_in_parallel", False))
         self.serial: Final = next(_SERIALS)
         self._inner: Final = weakref.ref(inner)
         self.manifest: Final = CallbackManifest(
@@ -127,6 +129,16 @@ def adapter_for(inner: CustomLogger) -> LegacyLogger:
     return adapter
 
 
+def _readable(value: object) -> TypeIs[Mapping[str, object]]:  # guard-ok: legacy kwargs are an untyped dict
+    return isinstance(value, Mapping)
+
+
+def _writable(
+    value: object,
+) -> TypeIs[MutableMapping[str, object]]:  # guard-ok: legacy kwargs are an untyped dict  # mutable-ok: written in place
+    return isinstance(value, MutableMapping)
+
+
 class KwargsFields(LiveFields):
     __slots__ = ("_keys", "_kwargs", "_response")
 
@@ -137,7 +149,7 @@ class KwargsFields(LiveFields):
 
     def _key(self, field: Field) -> str | None:
         key: Final = self._keys.get(field)
-        return key if isinstance(self._kwargs, Mapping) and key in self._kwargs else None
+        return key if key is not None and _readable(self._kwargs) and key in self._kwargs else None
 
     def __getitem__(self, field: Field) -> object:
         if field is Field.deprecated_kwargs:
@@ -145,9 +157,9 @@ class KwargsFields(LiveFields):
         if field is Field.deprecated_response_obj and self._response is not _ABSENT:
             return self._response
         key: Final = self._key(field)
-        if key is None or not isinstance(self._kwargs, Mapping):
+        if key is None or not _readable(self._kwargs):
             raise KeyError(field)
-        return _mapping_value(self._kwargs, key)
+        return self._kwargs[key]
 
     def __iter__(self) -> Iterator[Field]:
         return iter(tuple(field for field in Field if self._has(field)))
@@ -180,33 +192,16 @@ class KwargsFields(LiveFields):
         if current is None:
             target[self._keys[field]] = dict(keys)
             return
-        if not isinstance(current, MutableMapping):
+        if not _writable(current):
             raise InvalidPatchError(f"{field.value} holds no mapping here, so keys cannot be merged into it")
-        _update(current, keys)
+        current.update(keys)
 
     def _target(self, field: Field) -> MutableMapping[str, object]:  # mutable-ok: legacy kwargs are the live request
         if field not in self._keys:
             raise InvalidPatchError(f"{field.value} has no place in the legacy kwargs of this hook")
-        if not isinstance(self._kwargs, MutableMapping):
+        if not _writable(self._kwargs):
             raise InvalidPatchError(f"{field.value} cannot be written because the legacy kwargs are not a mapping")
-        return _string_keyed(self._kwargs)
-
-
-def _mapping_value(mapping: Mapping[object, object], key: str) -> object:
-    return mapping[key]
-
-
-def _string_keyed(
-    mapping: MutableMapping[str, object],  # mutable-ok: legacy kwargs are the live request
-) -> MutableMapping[str, object]:  # mutable-ok: same object handed back
-    return mapping
-
-
-def _update(
-    target: MutableMapping[str, object],  # mutable-ok: legacy kwargs are merged in place, as legacy hooks do
-    keys: Mapping[str, object],
-) -> None:
-    target.update(keys)
+        return self._kwargs
 
 
 def _apply_op(fields: Mapping[Field, object], op: PatchOp) -> Mapping[Field, object]:

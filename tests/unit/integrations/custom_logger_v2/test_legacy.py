@@ -1,6 +1,6 @@
 import asyncio
 import gc
-from collections.abc import Awaitable, Generator, Mapping
+from collections.abc import Awaitable, Generator
 from typing import Final
 
 import pytest
@@ -63,8 +63,10 @@ class Exporter(CustomLogger):
 
 
 class Masking(CustomLogger):
-    def logging_hook(self, *args: object, **kwargs: object) -> tuple[object, object]:
-        return ({}, None)
+    def logging_hook(
+        self, kwargs: dict[str, object], result: object, call_type: str
+    ) -> tuple[dict[str, object], object]:
+        return kwargs, result
 
 
 class Writer(CustomLoggerV2):
@@ -186,7 +188,7 @@ def test_legacy_kwargs_conflict_with_every_field_so_list_order_is_kept() -> None
 def _recording(journal: list[object], name: str, replacement: object = None):
     def start(logger: object, data: object) -> Awaitable[Patch | None]:
         async def run() -> Patch | None:
-            journal.append((name, data["messages"] if isinstance(data, Mapping) else None))
+            journal.append((name, KwargsFields(data, PROXY_REQUEST_KEYS)[F.messages]))
             return None if replacement is None else kwargs_patch(data, replacement)
 
         return run()
@@ -203,7 +205,9 @@ async def test_a_native_between_two_legacy_entries_sees_the_first_edit_and_patch
 
     def start(logger: object, data: object) -> Awaitable[Patch | None]:
         async def run() -> Patch | None:
-            journal.append(("first" if logger is first else "second", data["messages"]))
+            journal.append(
+                ("first" if logger is first else "second", KwargsFields(data, PROXY_REQUEST_KEYS)[F.messages])
+            )
             return kwargs_patch(data, replaced) if logger is first else None
 
         return run()

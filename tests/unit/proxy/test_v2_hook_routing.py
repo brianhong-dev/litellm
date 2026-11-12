@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Awaitable, Callable, Generator, Sequence
 from typing import Final
 
 import pytest
@@ -414,15 +414,15 @@ async def _drain() -> None:
         await asyncio.sleep(0)
 
 
-Action = Callable[[dict[str, object]], object]
+Action = Callable[[dict[str, object]], Awaitable[None] | Exception | str | dict[str, object] | None]
 
 
-def _passes(data: dict[str, object]) -> object:
+def _passes(data: dict[str, object]) -> None:
     return None
 
 
 class _PreCall(CustomLogger):
-    def __init__(self, name: str, journal: list[str], action: Action = _passes, enforces: bool = False) -> None:
+    def __init__(self, name: str, journal: list[object], action: Action = _passes, enforces: bool = False) -> None:
         super().__init__()
         self.name = name
         self.journal = journal
@@ -432,24 +432,24 @@ class _PreCall(CustomLogger):
 
     async def async_pre_call_hook(
         self, user_api_key_dict: UserAPIKeyAuth, cache: DualCache, data: dict[str, object], call_type: CallTypesLiteral
-    ) -> object:
+    ) -> Exception | str | dict[str, object] | None:
         self.journal.append(self.name)
         self.seen.append(data)
-        return self.action(data)
+        return await _settled(self.action(data))
 
     async def async_moderation_hook(
         self, data: dict[str, object], user_api_key_dict: UserAPIKeyAuth, call_type: CallTypesLiteral
     ) -> object:
         self.journal.append(self.name)
         await asyncio.sleep(0)
-        return self.action(data)
+        return await _settled(self.action(data))
 
 
 class _Guard(CustomGuardrail):
     def __init__(
         self,
         name: str,
-        journal: list[str],
+        journal: list[object],
         action: Action = _passes,
         parallel: bool = False,
         delay: float = 0.0,
@@ -462,15 +462,15 @@ class _Guard(CustomGuardrail):
         self.delay = delay
         self.seen_models: list[object] = []
 
-    async def _run(self, data: dict[str, object]) -> object:
+    async def _run(self, data: dict[str, object]) -> Exception | str | dict[str, object] | None:
         self.journal.append(self.name)
         self.seen_models.append(data.get("model"))
         await asyncio.sleep(self.delay)
-        return self.action(data)
+        return await _settled(self.action(data))
 
     async def async_pre_call_hook(
         self, user_api_key_dict: UserAPIKeyAuth, cache: DualCache, data: dict[str, object], call_type: CallTypesLiteral
-    ) -> object:
+    ) -> Exception | str | dict[str, object] | None:
         return await self._run(data)
 
     async def async_moderation_hook(
@@ -499,8 +499,14 @@ class _Native(CustomLoggerV2):
         return self.outcome
 
 
+async def _settled(
+    value: Awaitable[None] | Exception | str | dict[str, object] | None,
+) -> Exception | str | dict[str, object] | None:
+    return await value if isinstance(value, Awaitable) else value
+
+
 def _reroute(name: str) -> Action:
-    def action(data: dict[str, object]) -> object:
+    def action(data: dict[str, object]) -> None:
         raise SensitiveDataRouteException(
             route_to_model=name, session_id="s", guardrail_name=name, sticky_session_routing=False
         )
@@ -509,14 +515,14 @@ def _reroute(name: str) -> Action:
 
 
 def _raise(error: BaseException) -> Action:
-    def action(data: dict[str, object]) -> object:
+    def action(data: dict[str, object]) -> None:
         raise error
 
     return action
 
 
-def _returning(value: object) -> Action:
-    def action(data: dict[str, object]) -> object:
+def _returning(value: str | dict[str, object] | None) -> Action:
+    def action(data: dict[str, object]) -> str | dict[str, object] | None:
         return value
 
     return action
@@ -530,7 +536,7 @@ def _with_inert_native(callbacks: list[object], inert: bool) -> list[object]:
 async def test_pre_call_runs_sequential_entries_in_list_order_then_the_parallel_guardrails(
     monkeypatch: pytest.MonkeyPatch, proxy_logging: ProxyLogging, inert: bool
 ) -> None:
-    journal: Final[list[str]] = []
+    journal: Final[list[object]] = []
     callbacks: Final[list[object]] = [
         _Guard("parallel-1", journal, parallel=True),
         _PreCall("logger-1", journal),
@@ -568,7 +574,7 @@ async def test_pre_call_dict_replaces_the_request_and_none_keeps_it(
 async def test_pre_call_string_rejects_and_stops_the_line(
     monkeypatch: pytest.MonkeyPatch, proxy_logging: ProxyLogging, call_type: CallTypesLiteral, error: type[Exception]
 ) -> None:
-    journal: Final[list[str]] = []
+    journal: Final[list[object]] = []
     monkeypatch.setattr(
         litellm, "callbacks", [_PreCall("rejecter", journal, _returning("no thanks")), _PreCall("after", journal)]
     )
@@ -582,7 +588,7 @@ async def test_pre_call_string_rejects_and_stops_the_line(
 async def test_pre_call_sequential_exception_propagates_unchanged_and_stops_the_line(
     monkeypatch: pytest.MonkeyPatch, proxy_logging: ProxyLogging
 ) -> None:
-    journal: Final[list[str]] = []
+    journal: Final[list[object]] = []
     error: Final = HTTPException(status_code=403, detail="blocked")
     monkeypatch.setattr(litellm, "callbacks", [_Guard("blocker", journal, _raise(error)), _PreCall("after", journal)])
 
@@ -597,7 +603,7 @@ async def test_pre_call_sequential_exception_propagates_unchanged_and_stops_the_
 async def test_parallel_guardrails_pick_the_first_block_in_list_order_and_a_block_beats_a_reroute(
     monkeypatch: pytest.MonkeyPatch, proxy_logging: ProxyLogging, inert: bool
 ) -> None:
-    journal: Final[list[str]] = []
+    journal: Final[list[object]] = []
     slow_error: Final = ValueError("slow but first")
     callbacks: Final[list[object]] = [
         _Guard("reroute", journal, _reroute("onprem"), parallel=True),
@@ -605,20 +611,21 @@ async def test_parallel_guardrails_pick_the_first_block_in_list_order_and_a_bloc
         _Guard("fast", journal, _raise(HTTPException(status_code=400)), parallel=True),
     ]
     monkeypatch.setattr(litellm, "callbacks", _with_inert_native(callbacks, inert))
-    data: Final[dict[str, object]] = {"model": "m", "metadata": {}}
+    metadata: Final[dict[str, object]] = {}
+    data: Final[dict[str, object]] = {"model": "m", "metadata": metadata}
 
     with pytest.raises(ValueError, match="slow but first") as raised:
         await proxy_logging.pre_call_hook(user_api_key_dict=AUTH, data=data, call_type="completion")
 
     assert raised.value is slow_error
     assert data["model"] == "m"
-    assert data["metadata"]["applied_guardrails"] == ["slow", "fast"]
+    assert metadata["applied_guardrails"] == ["slow", "fast"]
 
 
 async def test_parallel_reroute_alone_reroutes_the_request(
     monkeypatch: pytest.MonkeyPatch, proxy_logging: ProxyLogging
 ) -> None:
-    journal: Final[list[str]] = []
+    journal: Final[list[object]] = []
     monkeypatch.setattr(litellm, "callbacks", [_Guard("reroute", journal, _reroute("onprem"), parallel=True)])
 
     result: Final = await proxy_logging.pre_call_hook(
@@ -632,7 +639,7 @@ async def test_parallel_reroute_alone_reroutes_the_request(
 async def test_deferred_reroute_lets_later_guardrails_run_and_the_first_reroute_wins(
     monkeypatch: pytest.MonkeyPatch, proxy_logging: ProxyLogging, inert: bool
 ) -> None:
-    journal: Final[list[str]] = []
+    journal: Final[list[object]] = []
     later: Final = _Guard("later", journal)
     parallel: Final = _Guard("parallel", journal, parallel=True)
     callbacks: Final[list[object]] = [
@@ -675,7 +682,7 @@ async def test_a_block_after_a_deferred_reroute_still_propagates(
 async def test_a_pipeline_managed_guardrail_runs_in_its_pipeline_and_not_again_in_the_line(
     monkeypatch: pytest.MonkeyPatch, proxy_logging: ProxyLogging
 ) -> None:
-    journal: Final[list[str]] = []
+    journal: Final[list[object]] = []
     monkeypatch.setattr(litellm, "callbacks", [_Guard("managed", journal), _Guard("unmanaged", journal)])
     pipeline: Final = GuardrailPipeline(mode="pre_call", steps=[PipelineStep(guardrail="managed", on_pass="next")])
     data: Final[dict[str, object]] = {
@@ -690,15 +697,19 @@ async def test_a_pipeline_managed_guardrail_runs_in_its_pipeline_and_not_again_i
 
 
 @pytest.mark.parametrize(
-    ("mode", "expected"),
+    ("skip_guardrails", "guardrails_only", "expected"),
     [
-        ({}, ["logger", "guard", ("native", None), "enforcer"]),
-        ({"skip_guardrails": True}, ["logger", ("native", None), "enforcer"]),
-        ({"guardrails_only": True}, ["guard", "enforcer"]),
+        (False, False, ["logger", "guard", ("native", None), "enforcer"]),
+        (True, False, ["logger", ("native", None), "enforcer"]),
+        (False, True, ["guard", "enforcer"]),
     ],
 )
 async def test_call_site_modes_choose_which_entries_run(
-    monkeypatch: pytest.MonkeyPatch, proxy_logging: ProxyLogging, mode: dict[str, bool], expected: list[object]
+    monkeypatch: pytest.MonkeyPatch,
+    proxy_logging: ProxyLogging,
+    skip_guardrails: bool,
+    guardrails_only: bool,
+    expected: list[object],
 ) -> None:
     journal: Final[list[object]] = []
     callbacks: Final[list[object]] = [
@@ -709,7 +720,13 @@ async def test_call_site_modes_choose_which_entries_run(
     ]
     monkeypatch.setattr(litellm, "callbacks", callbacks)
 
-    await proxy_logging.pre_call_hook(user_api_key_dict=AUTH, data={"model": "m"}, call_type="completion", **mode)
+    await proxy_logging.pre_call_hook(
+        user_api_key_dict=AUTH,
+        data={"model": "m"},
+        call_type="completion",
+        skip_guardrails=skip_guardrails,
+        guardrails_only=guardrails_only,
+    )
 
     assert journal == expected
 
@@ -717,7 +734,7 @@ async def test_call_site_modes_choose_which_entries_run(
 async def test_a_runtime_change_to_the_callback_list_reaches_the_next_request(
     monkeypatch: pytest.MonkeyPatch, proxy_logging: ProxyLogging
 ) -> None:
-    journal: Final[list[str]] = []
+    journal: Final[list[object]] = []
     first: Final = _PreCall("first", journal)
     callbacks: Final[list[object]] = [first]
     monkeypatch.setattr(litellm, "callbacks", callbacks)
@@ -736,14 +753,17 @@ async def test_a_native_between_two_legacy_loggers_sees_the_first_edit_and_the_s
 ) -> None:
     journal: Final[list[object]] = []
 
-    def edit(data: dict[str, object]) -> object:
+    def edit(data: dict[str, object]) -> None:
         data["messages"] = ["edited by the first"]
         return None
 
-    first: Final = _PreCall("first", [], edit)
-    second: Final = _PreCall("second", [], _returning(None))
     seen_by_second: Final[list[object]] = []
-    second.action = lambda data: seen_by_second.append(data["messages"])
+
+    def record(data: dict[str, object]) -> None:
+        seen_by_second.append(data["messages"])
+
+    first: Final = _PreCall("first", [], edit)
+    second: Final = _PreCall("second", [], record)
     monkeypatch.setattr(litellm, "callbacks", [first, _Native(journal, replacement=["patched by the native"]), second])
     data: Final[dict[str, object]] = {"model": "m", "messages": ["original"]}
 
@@ -775,15 +795,14 @@ async def test_a_native_abort_stops_the_line_before_later_legacy_loggers(
 async def test_during_call_starts_every_entry_in_list_order_and_returns_on_the_first_failure(
     monkeypatch: pytest.MonkeyPatch, proxy_logging: ProxyLogging, inert: bool
 ) -> None:
-    journal: Final[list[str]] = []
+    journal: Final[list[object]] = []
     release: Final = asyncio.Event()
     error: Final = RuntimeError("moderation failed")
 
     async def hold(data: dict[str, object]) -> None:
         await release.wait()
 
-    slow: Final = _Guard("slow", journal, event=GuardrailEventHooks.during_call)
-    slow.action = lambda data: hold(data)
+    slow: Final = _Guard("slow", journal, hold, event=GuardrailEventHooks.during_call)
     callbacks: Final[list[object]] = [
         slow,
         _PreCall("moderator", journal, _raise(error)),

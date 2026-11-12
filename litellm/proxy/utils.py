@@ -1977,7 +1977,6 @@ def _parallel_input(
 
 @dataclass(slots=True, eq=False)
 class _PreCallRun:
-    proxy: "ProxyLogging"
     user_api_key_dict: UserAPIKeyAuth
     call_type: CallTypesLiteral
     guardrails_only: bool
@@ -1990,121 +1989,6 @@ class _PreCallRun:
     parallel: list[tuple[CustomGuardrail, list[object]]] = field(  # mutable-ok: parallel results in list order
         default_factory=list
     )
-
-    def start(self, callback: object, request: object) -> Awaitable[Patch | None] | None:
-        data: Final = _request_dict(request)
-        if isinstance(callback, CustomGuardrail) and adapter_for(callback).parallel:
-            return self._start_parallel(callback, data)
-        return self._run_sequential(callback, data)
-
-    async def _run_sequential(
-        self,
-        callback: object,
-        data: dict[str, object] | None,  # mutable-ok: the live proxy request dict
-    ) -> Patch | None:
-        start_time: Final = time.time()
-        updated: dict[str, object] | None = data  # rebind-ok: a hook may replace the request  # mutable-ok: request
-        try:
-            if isinstance(callback, CustomGuardrail) and data is not None:
-                if self.skip_guardrails:
-                    return None
-                if callback.guardrail_name and callback.guardrail_name in self.pipeline_managed:
-                    return None
-                updated = await self.proxy._run_sequential_guardrail_callback(  # rebind-ok: see above
-                    callback=callback,
-                    data=data,
-                    raw_request_snapshot=self.raw_request_snapshot,
-                    user_api_key_dict=self.user_api_key_dict,
-                    call_type=self.call_type,
-                )
-            elif (
-                isinstance(callback, CustomLogger)
-                and (not self.guardrails_only or callback.enforces_request_content)
-                and _overrides_hook(callback, "async_pre_call_hook")
-            ):
-                if self.call_type in MCP_GUARDRAIL_CALL_TYPES and self.user_api_key_dict is None:
-                    return None
-                response: Final[Exception | str | Mapping[str, object] | None] = (
-                    await callback.async_pre_call_hook(
-                        user_api_key_dict=self.user_api_key_dict,
-                        cache=self.proxy.call_details["user_api_key_cache"],
-                        data=data,
-                        call_type=self.call_type,
-                        endpoint_type=self.endpoint_type,
-                    )
-                    if isinstance(callback, PROXY_MaxParallelRequestsHandler_v3)
-                    else await callback.async_pre_call_hook(
-                        user_api_key_dict=self.user_api_key_dict,
-                        cache=self.proxy.call_details["user_api_key_cache"],
-                        data=data,
-                        call_type=self.call_type,
-                    )
-                )
-                if response is not None:
-                    updated = await self.proxy.process_pre_call_hook_response(  # rebind-ok: see above
-                        response=response, data=data, call_type=self.call_type
-                    )
-        except SensitiveDataRouteException as e:
-            if self.deferred is None:
-                self.deferred = e
-
-        end_time: Final = time.time()
-        duration: Final = end_time - start_time
-        if hasattr(self.proxy, "service_logging_obj") and duration > 0.01:
-            await self.proxy.service_logging_obj.async_service_success_hook(
-                service=ServiceTypes.PROXY_PRE_CALL,
-                duration=duration,
-                call_type=f"{callback.__class__.__name__}",
-                parent_otel_span=getattr(self.user_api_key_dict, "parent_otel_span", None),
-                start_time=start_time,
-                end_time=end_time,
-            )
-        self.latest = updated
-        return kwargs_patch(data, updated)
-
-    async def apply_deferred_reroute(self, fields: Mapping[Field, object]) -> Mapping[Field, object]:
-        data: Final = _request_dict(fields[Field.deprecated_kwargs])
-        if self.deferred is None or data is None:
-            return fields
-        rerouted: Final = await self.proxy._handle_sensitive_data_route_exception(
-            self.deferred, data, self.user_api_key_dict
-        )
-        self.latest = rerouted
-        return apply_patch(fields, Patch().set(Field.deprecated_kwargs, rerouted))
-
-    def _start_parallel(
-        self,
-        callback: CustomGuardrail,
-        data: dict[str, object] | None,  # mutable-ok: the live proxy request dict
-    ) -> Awaitable[None] | None:
-        if self.skip_guardrails or data is None:
-            return None
-        if callback.guardrail_name and callback.guardrail_name in self.pipeline_managed:
-            return None
-        slot: Final[list[object]] = []  # mutable-ok: filled with this guardrail's result or exception
-        self.parallel.append((callback, slot))
-        return self._run_parallel(callback, _parallel_input(callback, data, self.raw_request_snapshot), slot)
-
-    async def _run_parallel(
-        self,
-        callback: CustomGuardrail,
-        data: dict[str, object],  # mutable-ok: the live request or a raw-request snapshot
-        slot: list[object],  # mutable-ok: see _start_parallel
-    ) -> None:
-        try:
-            result: Final = await self.proxy._process_guardrail_callback(
-                callback=callback,
-                data=data,
-                user_api_key_dict=self.user_api_key_dict,
-                call_type=self.call_type,
-                event_type=GuardrailEventHooks.pre_call,
-            )
-        except BaseException as e:
-            slot.append(e)
-            if _exception_changes_request_flow(e):
-                return
-            raise
-        slot.append(result)
 
     def settle_parallel(self) -> None:
         data: Final = self.latest
@@ -3476,7 +3360,6 @@ class ProxyLogging:
 
         return await self._dispatch_pre_call(
             _PreCallRun(
-                proxy=self,
                 user_api_key_dict=user_api_key_dict,
                 call_type=call_type,
                 guardrails_only=guardrails_only,
@@ -3514,7 +3397,10 @@ class ProxyLogging:
             line: Final = hook_line(Hook.pre_call, caps.hook_callbacks, natives=not run.guardrails_only)
             try:
                 result: Final = await run_line(
-                    line, KwargsFields(run.latest, PROXY_REQUEST_KEYS), run.start, between=run.apply_deferred_reroute
+                    line,
+                    KwargsFields(run.latest, PROXY_REQUEST_KEYS),
+                    partial(self._pre_call_start, run),
+                    between=partial(self._pre_call_deferred_reroute, run),
                 )
             finally:
                 run.settle_parallel()
@@ -3533,6 +3419,124 @@ class ProxyLogging:
             if run.latest is not None:
                 self._process_guardrail_metadata(run.latest, skip_guardrails=run.skip_guardrails)
             raise
+
+    def _pre_call_start(self, run: _PreCallRun, callback: object, request: object) -> Awaitable[Patch | None] | None:
+        data: Final = _request_dict(request)
+        if isinstance(callback, CustomGuardrail) and adapter_for(callback).parallel:
+            return self._pre_call_start_parallel(run, callback, data)
+        return self._pre_call_sequential(run, callback, data)
+
+    async def _pre_call_sequential(
+        self,
+        run: _PreCallRun,
+        callback: object,
+        data: dict[str, object] | None,  # mutable-ok: the live proxy request dict
+    ) -> Patch | None:
+        start_time: Final = time.time()
+        updated: dict[str, object] | None = data  # rebind-ok: a hook may replace the request  # mutable-ok: request
+        try:
+            if isinstance(callback, CustomGuardrail) and data is not None:
+                if run.skip_guardrails:
+                    return None
+                if callback.guardrail_name and callback.guardrail_name in run.pipeline_managed:
+                    return None
+                updated = await self._run_sequential_guardrail_callback(  # rebind-ok: see above
+                    callback=callback,
+                    data=data,
+                    raw_request_snapshot=run.raw_request_snapshot,
+                    user_api_key_dict=run.user_api_key_dict,
+                    call_type=run.call_type,
+                )
+            elif (
+                isinstance(callback, CustomLogger)
+                and (not run.guardrails_only or callback.enforces_request_content)
+                and _overrides_hook(callback, "async_pre_call_hook")
+            ):
+                if run.call_type in MCP_GUARDRAIL_CALL_TYPES and run.user_api_key_dict is None:
+                    return None
+                response: Final[Exception | str | Mapping[str, object] | None] = (
+                    await callback.async_pre_call_hook(
+                        user_api_key_dict=run.user_api_key_dict,
+                        cache=self.call_details["user_api_key_cache"],
+                        data=data,
+                        call_type=run.call_type,
+                        endpoint_type=run.endpoint_type,
+                    )
+                    if isinstance(callback, PROXY_MaxParallelRequestsHandler_v3)
+                    else await callback.async_pre_call_hook(
+                        user_api_key_dict=run.user_api_key_dict,
+                        cache=self.call_details["user_api_key_cache"],
+                        data=data,
+                        call_type=run.call_type,
+                    )
+                )
+                if response is not None:
+                    updated = await self.process_pre_call_hook_response(  # rebind-ok: see above
+                        response=response, data=data, call_type=run.call_type
+                    )
+        except SensitiveDataRouteException as e:
+            if run.deferred is None:
+                run.deferred = e
+
+        end_time: Final = time.time()
+        duration: Final = end_time - start_time
+        if hasattr(self, "service_logging_obj") and duration > 0.01:
+            await self.service_logging_obj.async_service_success_hook(
+                service=ServiceTypes.PROXY_PRE_CALL,
+                duration=duration,
+                call_type=f"{callback.__class__.__name__}",
+                parent_otel_span=getattr(run.user_api_key_dict, "parent_otel_span", None),
+                start_time=start_time,
+                end_time=end_time,
+            )
+        run.latest = updated
+        return kwargs_patch(data, updated)
+
+    async def _pre_call_deferred_reroute(
+        self, run: _PreCallRun, fields: Mapping[Field, object]
+    ) -> Mapping[Field, object]:
+        data: Final = _request_dict(fields[Field.deprecated_kwargs])
+        if run.deferred is None or data is None:
+            return fields
+        rerouted: Final = await self._handle_sensitive_data_route_exception(run.deferred, data, run.user_api_key_dict)
+        run.latest = rerouted
+        return apply_patch(fields, Patch().set(Field.deprecated_kwargs, rerouted))
+
+    def _pre_call_start_parallel(
+        self,
+        run: _PreCallRun,
+        callback: CustomGuardrail,
+        data: dict[str, object] | None,  # mutable-ok: the live proxy request dict
+    ) -> Awaitable[None] | None:
+        if run.skip_guardrails or data is None:
+            return None
+        if callback.guardrail_name and callback.guardrail_name in run.pipeline_managed:
+            return None
+        slot: Final[list[object]] = []  # mutable-ok: filled with this guardrail's result or exception
+        run.parallel.append((callback, slot))
+        return self._pre_call_parallel(run, callback, _parallel_input(callback, data, run.raw_request_snapshot), slot)
+
+    async def _pre_call_parallel(
+        self,
+        run: _PreCallRun,
+        callback: CustomGuardrail,
+        data: dict[str, object],  # mutable-ok: the live request or a raw-request snapshot
+        slot: list[object],  # mutable-ok: see _pre_call_start_parallel
+    ) -> None:
+        try:
+            result: Final = await self._process_guardrail_callback(
+                callback=callback,
+                data=data,
+                user_api_key_dict=run.user_api_key_dict,
+                call_type=run.call_type,
+                event_type=GuardrailEventHooks.pre_call,
+            )
+        except BaseException as e:
+            slot.append(e)
+            if _exception_changes_request_flow(e):
+                return
+            raise
+        slot.append(result)
 
     async def _handle_sensitive_data_route_exception(
         self,
