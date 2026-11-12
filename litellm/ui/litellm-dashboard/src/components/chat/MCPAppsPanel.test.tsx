@@ -15,8 +15,23 @@ vi.mock("../networking", () => ({
   deleteMCPOAuthUserCredential: vi.fn(),
 }));
 
+const oauthReturn = vi.hoisted(() => ({ serverId: null as string | null, status: "idle", onSuccess: () => {} }));
 vi.mock("@/hooks/useUserMcpOAuthFlow", () => ({
-  useUserMcpOAuthFlow: () => ({ startOAuthFlow: vi.fn(), status: "idle" }),
+  pendingUserMcpOAuthServerId: () => oauthReturn.serverId,
+  useUserMcpOAuthFlow: ({
+    serverId,
+    serverAlias,
+    onSuccess,
+  }: {
+    serverId: string;
+    serverAlias?: string;
+    onSuccess: () => void;
+  }) => {
+    if (serverId !== oauthReturn.serverId || serverAlias !== undefined)
+      return { startOAuthFlow: vi.fn(), status: "idle" };
+    oauthReturn.onSuccess = onSuccess;
+    return { startOAuthFlow: vi.fn(), status: oauthReturn.status };
+  },
 }));
 
 const servers = [
@@ -120,6 +135,8 @@ const renderConnectPanel = (connectMode: boolean, selectedServers: string[] = []
 describe("MCPAppsPanel connected-app reachability (LIT-4861)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    oauthReturn.serverId = null;
+    oauthReturn.status = "idle";
   });
 
   it("reports the id of each server it shows as connected in connect mode", async () => {
@@ -232,6 +249,79 @@ describe("MCPAppsPanel connected-app reachability (LIT-4861)", () => {
 
     await waitFor(() => expect(onConnectedServerIds).toHaveBeenCalled());
     expect(onConnectedServerIds.mock.calls).toEqual([[["s-oauth", "s-reach"]]]);
+  });
+
+  const oauthReturnPage = (onConnectedServerIds: (ids: string[] | null) => void) => {
+    vi.mocked(fetchMCPServers).mockResolvedValue([
+      {
+        server_id: "s-oauth",
+        server_name: "oauth_srv",
+        auth_type: "oauth2",
+        oauth2_flow: "authorization_code",
+        connected_app_reachable: true,
+      },
+      ...connectServers,
+    ] as MCPServer[]);
+    vi.mocked(listMCPTools).mockResolvedValue({ tools: [] });
+    vi.mocked(getMCPOAuthUserCredentialStatus).mockResolvedValue({
+      server_id: "s-oauth",
+      has_credential: false,
+      is_expired: false,
+    } as MCPOAuthUserCredentialStatus);
+    const Page = () => {
+      const [selected, setSelected] = React.useState<string[]>(["reachable_srv"]);
+      return (
+        <MCPAppsPanel
+          accessToken="tok"
+          selectedServers={selected}
+          onChange={setSelected}
+          connectMode
+          onConnectedServerIds={onConnectedServerIds}
+        />
+      );
+    };
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = () => (
+      <QueryClientProvider client={client}>
+        <Page />
+      </QueryClientProvider>
+    );
+    const { rerender } = render(tree());
+    return () => rerender(tree());
+  };
+
+  it("holds the report until the login returning from OAuth is saved, then includes its server", async () => {
+    oauthReturn.serverId = "s-oauth";
+    oauthReturn.status = "exchanging";
+    const onConnectedServerIds = vi.fn();
+    oauthReturnPage(onConnectedServerIds);
+
+    expect(await screen.findByText("oauth_srv")).toBeInTheDocument();
+    await waitFor(() => expect(getMCPOAuthUserCredentialStatus).toHaveBeenCalled());
+    await act(async () => {});
+    expect(screen.queryByText("Connect", { exact: true })).not.toBeInTheDocument();
+
+    await act(async () => {
+      oauthReturn.status = "success";
+      oauthReturn.onSuccess();
+    });
+
+    expect(onConnectedServerIds.mock.calls.filter(([ids]) => ids !== null)).toEqual([[["s-oauth", "s-reach"]]]);
+  });
+
+  it("reports the earlier picks when the login returning from OAuth fails", async () => {
+    oauthReturn.serverId = "s-oauth";
+    oauthReturn.status = "exchanging";
+    const onConnectedServerIds = vi.fn();
+    const rerenderPage = oauthReturnPage(onConnectedServerIds);
+
+    expect(await screen.findByText("oauth_srv")).toBeInTheDocument();
+    await waitFor(() => expect(getMCPOAuthUserCredentialStatus).toHaveBeenCalled());
+    await act(async () => {});
+    oauthReturn.status = "error";
+    rerenderPage();
+
+    await waitFor(() => expect(onConnectedServerIds).toHaveBeenLastCalledWith(["s-reach"]));
   });
 
   it("reports nothing while a Connect is still loading the server's tools", async () => {

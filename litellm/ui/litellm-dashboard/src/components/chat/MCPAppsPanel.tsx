@@ -24,7 +24,7 @@ import {
 import { Logo } from "@/components/molecules/logo/Logo";
 import i18n from "@/i18n/i18n";
 import { toast } from "@/lib/toast";
-import { useUserMcpOAuthFlow } from "@/hooks/useUserMcpOAuthFlow";
+import { pendingUserMcpOAuthServerId, useUserMcpOAuthFlow } from "@/hooks/useUserMcpOAuthFlow";
 import { getSecureItem, setSecureItem } from "@/utils/secureStorage";
 
 interface OAuth2ConnectButtonProps {
@@ -177,6 +177,25 @@ const MCPAppsPanel: React.FC<Props> = ({
     [connectUnavailabilityLabel],
   );
 
+  const turnOnOAuthServer = useCallback(
+    (serverId: string) => {
+      setOauthConnected((prev) => new Set(prev).add(serverId));
+      const server = connectableNow(serverId);
+      if (server !== undefined && !selectedServersRef.current.includes(nameOf(server))) {
+        selectedServersRef.current = [...selectedServersRef.current, nameOf(server)];
+        onChangeRef.current(selectedServersRef.current);
+      }
+    },
+    [connectableNow],
+  );
+
+  const [returningServerId] = useState(() => pendingUserMcpOAuthServerId() ?? "");
+  const returningOAuth = useUserMcpOAuthFlow({
+    accessToken,
+    serverId: returningServerId,
+    onSuccess: useCallback(() => turnOnOAuthServer(returningServerId), [turnOnOAuthServer, returningServerId]),
+  });
+
   const fetchToolCount = useCallback(
     async (server: MCPServer, isCurrentLoad: () => boolean) => {
       try {
@@ -196,13 +215,7 @@ const MCPAppsPanel: React.FC<Props> = ({
       try {
         const status = await getMCPOAuthUserCredentialStatus(accessToken, server.server_id);
         if (!isCurrentLoad()) return;
-        if (status.has_credential && !status.is_expired) {
-          setOauthConnected((prev) => new Set(prev).add(server.server_id));
-          if (!selectedServersRef.current.includes(nameOf(server)) && connectUnavailabilityLabel(server) === null) {
-            selectedServersRef.current = [...selectedServersRef.current, nameOf(server)];
-            onChangeRef.current(selectedServersRef.current);
-          }
-        }
+        if (status.has_credential && !status.is_expired) turnOnOAuthServer(server.server_id);
       } catch {
         // ignore
       } finally {
@@ -215,7 +228,7 @@ const MCPAppsPanel: React.FC<Props> = ({
         }
       }
     },
-    [accessToken, connectUnavailabilityLabel],
+    [accessToken, turnOnOAuthServer],
   );
 
   useEffect(() => {
@@ -319,7 +332,10 @@ const MCPAppsPanel: React.FC<Props> = ({
       if (oauthConnected.has(server.server_id)) {
         return <CheckCircle className="h-3.5 w-3.5 text-success shrink-0" />;
       }
-      if (oauthChecking.has(server.server_id)) {
+      if (
+        oauthChecking.has(server.server_id) ||
+        (returningOAuth.status === "exchanging" && server.server_id === returningServerId)
+      ) {
         return <Skeleton className="h-6 w-16 shrink-0 rounded-md" />;
       }
       return (
@@ -367,9 +383,17 @@ const MCPAppsPanel: React.FC<Props> = ({
   );
   const connectedCount = connectedServerIds.length;
   useEffect(() => {
-    if (togglingOn.size > 0) onConnectedServerIds?.(null);
+    if (togglingOn.size > 0 || returningOAuth.status === "exchanging") onConnectedServerIds?.(null);
     else if (!loading && !loadFailed && oauthChecking.size === 0) onConnectedServerIds?.(connectedServerIds);
-  }, [loading, loadFailed, oauthChecking.size, togglingOn.size, connectedServerIds, onConnectedServerIds]);
+  }, [
+    loading,
+    loadFailed,
+    oauthChecking.size,
+    togglingOn.size,
+    returningOAuth.status,
+    connectedServerIds,
+    onConnectedServerIds,
+  ]);
 
   const emptyStateText = () => {
     if (loadFailed) return t("chat.mcpAppsPanel.empty.loadFailed");

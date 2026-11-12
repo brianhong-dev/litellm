@@ -69,6 +69,15 @@ const getStorage = (key: string): string | null => {
   return getSecureItem(key);
 };
 
+export const pendingUserMcpOAuthServerId = (): string | null => {
+  if (typeof window === "undefined" || getStorage(RESULT_KEY) === null) return null;
+  try {
+    return (JSON.parse(getStorage(FLOW_STATE_KEY) ?? "null") as StoredFlowState | null)?.serverId ?? null;
+  } catch (_) {
+    return null;
+  }
+};
+
 const grantedScopes = (scope: unknown, requested: string[] | undefined): string[] | undefined =>
   typeof scope === "string" ? scope.split(" ").filter(Boolean) : requested;
 

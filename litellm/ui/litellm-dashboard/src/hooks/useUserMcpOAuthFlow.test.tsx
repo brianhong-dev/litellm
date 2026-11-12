@@ -2,7 +2,7 @@ import { renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as networking from "@/components/networking";
 import { setSecureItem } from "@/utils/secureStorage";
-import { useUserMcpOAuthFlow } from "./useUserMcpOAuthFlow";
+import { pendingUserMcpOAuthServerId, useUserMcpOAuthFlow } from "./useUserMcpOAuthFlow";
 
 vi.mock("@/components/networking", () => ({
   exchangeMcpOAuthToken: vi.fn(),
@@ -67,5 +67,22 @@ describe("user OAuth granted scopes", () => {
       expectedCredential,
     );
     expect(onSuccess).toHaveBeenCalledOnce();
+  });
+});
+
+describe("pending user OAuth return", () => {
+  beforeEach(() => {
+    window.sessionStorage.clear();
+    setSecureItem("litellm-user-mcp-oauth-flow-state", JSON.stringify({ serverId: "server-1" }));
+  });
+
+  it("names the server whose login came back", () => {
+    setSecureItem("litellm-user-mcp-oauth-result", JSON.stringify({ code: "provider-code" }));
+
+    expect(pendingUserMcpOAuthServerId()).toBe("server-1");
+  });
+
+  it("names nothing while the login has not come back", () => {
+    expect(pendingUserMcpOAuthServerId()).toBeNull();
   });
 });
