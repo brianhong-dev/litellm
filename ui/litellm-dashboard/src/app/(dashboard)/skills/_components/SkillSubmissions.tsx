@@ -7,6 +7,7 @@ import {
   getSkillSubmission,
   listSkillSubmissions,
   reviewSkillSubmission,
+  withdrawSkillSubmission,
 } from "@/components/networking";
 import type { SkillHubSkill, SkillSubmission } from "@/components/claude_code_plugins/types";
 import { Badge } from "@/components/ui/badge";
@@ -16,6 +17,16 @@ import { Textarea } from "@/components/ui/textarea";
 import { useUrlTableState, type UrlTableStateOptions } from "@/components/shared/DataTable/useUrlTableState";
 import SkillScanPanel from "./SkillScanPanel";
 import { toast } from "@/lib/toast";
+import AddPluginForm from "./add_plugin_form";
+import {
+  AlertDialog,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 
 const METADATA_FIELDS = ["name", "version", "description", "source", "keywords", "domain", "namespace"] as const;
 
@@ -28,6 +39,7 @@ const STATUS_CLASSES = {
   pending_review: "border-warning/30 text-warning",
   approved: "border-success/30 text-success",
   rejected: "border-destructive/30 text-destructive",
+  withdrawn: "border-muted text-muted-foreground",
 };
 
 const SUBMISSION_TABLE_STATE: UrlTableStateOptions<never> = {
@@ -135,38 +147,68 @@ interface SubmissionReviewProps {
   accessToken: string;
   queryScope: QueryKey;
   canReview: boolean;
+  canWrite: boolean;
   onClose: () => void;
   onChanged: () => Promise<void>;
 }
 
-function SubmissionReview({ id, accessToken, queryScope, canReview, onClose, onChanged }: SubmissionReviewProps) {
+function SubmissionReview({
+  id,
+  accessToken,
+  queryScope,
+  canReview,
+  canWrite,
+  onClose,
+  onChanged,
+}: SubmissionReviewProps) {
   const { t } = useTranslation();
   const [reason, setReason] = useState("");
   const [busy, setBusy] = useState(false);
   const [downloading, setDownloading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const detail = useQuery({
+  const [editing, setEditing] = useState<SkillSubmission | null>(null);
+  const [withdrawing, setWithdrawing] = useState<SkillSubmission | null>(null);
+  const detailOptions = {
     queryKey: [...queryScope, "submission", id],
     queryFn: () => getSkillSubmission(accessToken, id),
-  });
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+  };
+  const detail = useQuery(detailOptions);
   const { submission, current_skill: current } = detail.data ?? {};
   const canDecide = canReview && submission?.status === "pending_review";
   const review = async (action: "approve" | "reject") => {
-    if (!canDecide || busy) return;
+    if (!canDecide || !submission || busy) return;
     setBusy(true);
     setError(null);
     try {
-      await reviewSkillSubmission(
-        accessToken,
-        id,
-        action,
-        action === "reject" ? { reason: reason.trim() || null } : undefined,
-      );
+      await reviewSkillSubmission(accessToken, id, action, {
+        expected_revision: submission.revision ?? 0,
+        ...(action === "reject" ? { reason: reason.trim() || null } : {}),
+      });
       onClose();
       await onChanged();
       toast.success(t(action === "approve" ? "skills.submissions.approved" : "skills.submissions.rejected"));
     } catch (err) {
       setError(err instanceof Error ? err.message : t("skills.submissions.actionFailed"));
+      await onChanged();
+    } finally {
+      setBusy(false);
+    }
+  };
+  const withdraw = async () => {
+    if (!withdrawing || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await withdrawSkillSubmission(accessToken, withdrawing);
+      setWithdrawing(null);
+      onClose();
+      await onChanged();
+      toast.success(t("skills.submissions.withdrawn"));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t("skills.submissions.actionFailed"));
+      setWithdrawing(null);
       await onChanged();
     } finally {
       setBusy(false);
@@ -185,73 +227,127 @@ function SubmissionReview({ id, accessToken, queryScope, canReview, onClose, onC
     }
   };
   return (
-    <Dialog open onOpenChange={(open) => !open && !busy && onClose()}>
-      <DialogContent className="top-8 max-h-[calc(100dvh-4rem)] translate-y-0 overflow-y-auto sm:max-w-[960px]">
-        <DialogHeader>
-          <DialogTitle>{t("skills.submissions.reviewTitle", { name: submission?.skill_name ?? "" })}</DialogTitle>
-        </DialogHeader>
-        {detail.isPending && <p>{t("skills.submissions.loading")}</p>}
-        {detail.isError && (
-          <div role="alert" className="text-destructive">
-            {t("skills.submissions.loadFailed")}
-            <Button variant="link" onClick={() => void detail.refetch()}>
-              {t("skills.submissions.retry")}
-            </Button>
-          </div>
-        )}
-        {submission && (
-          <>
-            <SubmissionSummary submission={submission} />
-            {!current && <p className="text-sm text-muted-foreground">{t("skills.submissions.noCurrent")}</p>}
-            <SubmissionComparison submission={submission} current={current} />
-            {submission.has_archive && submission.proposal.agent_skill && (
-              <Button variant="outline" onClick={download} disabled={downloading}>
-                {t(downloading ? "skills.submissions.downloading" : "skills.submissions.download")}
+    <>
+      <Dialog open={!editing && !withdrawing} onOpenChange={(open) => !open && !busy && onClose()}>
+        <DialogContent className="top-8 max-h-[calc(100dvh-4rem)] translate-y-0 overflow-y-auto sm:max-w-[960px]">
+          <DialogHeader>
+            <DialogTitle>{t("skills.submissions.reviewTitle", { name: submission?.skill_name ?? "" })}</DialogTitle>
+          </DialogHeader>
+          {detail.isPending && <p>{t("skills.submissions.loading")}</p>}
+          {detail.isError && (
+            <div role="alert" className="text-destructive">
+              {t("skills.submissions.loadFailed")}
+              <Button variant="link" onClick={() => void detail.refetch()}>
+                {t("skills.submissions.retry")}
               </Button>
-            )}
-            {canReview && (
-              <SkillScanPanel
-                id={id}
-                accessToken={accessToken}
-                queryScope={queryScope}
-                pending={submission.status === "pending_review"}
-              />
-            )}
-            {canDecide && (
-              <>
-                <label htmlFor="skill-rejection-reason" className="text-sm font-medium">
-                  {t("skills.submissions.reasonLabel")}
-                </label>
-                <Textarea
-                  id="skill-rejection-reason"
-                  value={reason}
-                  maxLength={2000}
-                  onChange={(event) => setReason(event.target.value)}
-                  disabled={busy}
-                />
-                <div className="flex justify-end gap-2">
+            </div>
+          )}
+          {submission && (
+            <>
+              <SubmissionSummary submission={submission} />
+              {!current && <p className="text-sm text-muted-foreground">{t("skills.submissions.noCurrent")}</p>}
+              <SubmissionComparison submission={submission} current={current} />
+              {canWrite && submission.can_edit && (
+                <div className="flex gap-2">
+                  <Button
+                    variant="outline"
+                    disabled={busy || detail.isFetching || detail.isError}
+                    onClick={() => setEditing(submission)}
+                  >
+                    {t("skills.submissions.edit")}
+                  </Button>
                   <Button
                     variant="destructive"
-                    onClick={() => void review("reject")}
                     disabled={busy || detail.isFetching || detail.isError}
+                    onClick={() => setWithdrawing(submission)}
                   >
-                    {t("skills.submissions.reject")}
-                  </Button>
-                  <Button onClick={() => void review("approve")} disabled={busy || detail.isFetching || detail.isError}>
-                    {t("skills.submissions.approve")}
+                    {t("skills.submissions.withdraw")}
                   </Button>
                 </div>
-              </>
-            )}
-          </>
-        )}
-        {error && (
-          <p role="alert" className="text-sm text-destructive">
-            {error}
-          </p>
-        )}
-      </DialogContent>
-    </Dialog>
+              )}
+              {submission.has_archive && submission.proposal.agent_skill && (
+                <Button variant="outline" onClick={download} disabled={downloading}>
+                  {t(downloading ? "skills.submissions.downloading" : "skills.submissions.download")}
+                </Button>
+              )}
+              {canReview && (
+                <SkillScanPanel
+                  id={id}
+                  accessToken={accessToken}
+                  queryScope={queryScope}
+                  pending={submission.status === "pending_review"}
+                />
+              )}
+              {canDecide && (
+                <>
+                  <label htmlFor="skill-rejection-reason" className="text-sm font-medium">
+                    {t("skills.submissions.reasonLabel")}
+                  </label>
+                  <Textarea
+                    id="skill-rejection-reason"
+                    value={reason}
+                    maxLength={2000}
+                    onChange={(event) => setReason(event.target.value)}
+                    disabled={busy}
+                  />
+                  <div className="flex justify-end gap-2">
+                    <Button
+                      variant="destructive"
+                      onClick={() => void review("reject")}
+                      disabled={busy || detail.isFetching || detail.isError}
+                    >
+                      {t("skills.submissions.reject")}
+                    </Button>
+                    <Button
+                      onClick={() => void review("approve")}
+                      disabled={busy || detail.isFetching || detail.isError}
+                    >
+                      {t("skills.submissions.approve")}
+                    </Button>
+                  </div>
+                </>
+              )}
+            </>
+          )}
+          {error && (
+            <p role="alert" className="text-sm text-destructive">
+              {error}
+            </p>
+          )}
+        </DialogContent>
+      </Dialog>
+      {editing && (
+        <AddPluginForm
+          key={`${editing.id}-${editing.revision}`}
+          visible
+          accessToken={accessToken}
+          skill={{ ...editing.proposal, id: editing.id, visibility: "private", security_scan_passed: false }}
+          submission={{
+            value: editing,
+            publishedVersion: current?.version ?? null,
+            onChanged: () => {
+              void onChanged();
+            },
+          }}
+          onClose={() => setEditing(null)}
+          requiresApproval
+        />
+      )}
+      <AlertDialog open={Boolean(withdrawing)} onOpenChange={(open) => !open && !busy && setWithdrawing(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("skills.submissions.withdraw")}</AlertDialogTitle>
+            <AlertDialogDescription>{t("skills.submissions.withdrawNotice")}</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={busy}>{t("skills.addForm.cancel")}</AlertDialogCancel>
+            <Button variant="destructive" disabled={busy} onClick={() => void withdraw()}>
+              {t("skills.submissions.confirmWithdraw")}
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
   );
 }
 
@@ -259,6 +355,7 @@ interface SkillSubmissionsProps {
   accessToken: string;
   queryScope: QueryKey;
   canReview: boolean;
+  canWrite: boolean;
   adminView: boolean;
   onChanged: () => Promise<void>;
 }
@@ -267,6 +364,7 @@ export default function SkillSubmissions({
   accessToken,
   queryScope,
   canReview,
+  canWrite,
   adminView,
   onChanged,
 }: SkillSubmissionsProps) {
@@ -358,6 +456,7 @@ export default function SkillSubmissions({
           accessToken={accessToken}
           queryScope={queryScope}
           canReview={canReview}
+          canWrite={canWrite}
           onClose={() => setSelectedId(null)}
           onChanged={onChanged}
         />
