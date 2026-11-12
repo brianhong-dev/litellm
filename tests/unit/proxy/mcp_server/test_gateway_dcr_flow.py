@@ -3706,7 +3706,7 @@ async def test_picks_too_many_for_a_session_token_are_refused(picked_count: int,
 @pytest.mark.asyncio
 async def test_every_narrowed_grant_near_the_size_cap_refreshes() -> None:
     fleet: Final = tuple(_fleet_server(index) for index in range(80))
-    outcomes: Final[list[int]] = []
+    outcomes: Final = list[int]()
     for picked_count in range(50, 80):
         picked = fleet[:picked_count]
         client_id, completed = await _complete_with_selection(tuple(server.server_id for server in picked), picked)
