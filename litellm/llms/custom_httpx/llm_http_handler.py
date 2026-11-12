@@ -47,7 +47,8 @@ from litellm.anthropic_beta_headers_manager import (
 from litellm.constants import MAX_FILE_LIST_LIMIT, REALTIME_WEBSOCKET_MAX_MESSAGE_SIZE_BYTES
 from litellm.files.types import FileContentStreamingResult
 from litellm.integrations.custom_logger_v2.enums import Hook
-from litellm.integrations.custom_logger_v2.host import has_natives
+from litellm.integrations.custom_logger_v2.legacy import Admit, hook_line
+from litellm.integrations.custom_logger_v2.logger import CustomLoggerV2
 from litellm.litellm_core_utils.agentic_followup_kwargs import build_agentic_followup_kwargs
 from litellm.litellm_core_utils.agentic_loop_refusal import (
     called_tool_names,
@@ -223,7 +224,6 @@ from litellm.utils import (
     ModelResponse,
     ProviderConfigManager,
     async_pre_call_deployment_hook,
-    route_through_dispatcher,
 )
 
 
@@ -556,9 +556,7 @@ def _run_responses_deployment_hook(
     litellm_params: GenericLiteLLMParams,
 ) -> Mapping[str, object]:
     return run_async_function(
-        route_through_dispatcher(Hook.pre_deployment_call, async_pre_call_deployment_hook)
-        if has_natives(Hook.pre_deployment_call)
-        else async_pre_call_deployment_hook,
+        async_pre_call_deployment_hook,
         {
             **dict(litellm_params),
             **optional_params,
@@ -567,6 +565,14 @@ def _run_responses_deployment_hook(
             "custom_llm_provider": custom_llm_provider,
         },
         CallTypes.responses.value,
+        natives=True,
+    )
+
+
+def _has_native_deployment_hook() -> bool:
+    return (
+        Hook.pre_deployment_call in CustomLoggerV2.declared_hooks
+        and hook_line(Hook.pre_deployment_call, litellm.callbacks, admit=Admit.every_logger).has_natives
     )
 
 
@@ -2953,7 +2959,7 @@ class BaseLLMHTTPHandler:
         dict[str, object],
         GenericLiteLLMParams,
     ]:
-        if not _has_pre_call_deployment_hook(logging_obj):
+        if not _has_pre_call_deployment_hook(logging_obj) and not _has_native_deployment_hook():
             return (
                 model,
                 input,
