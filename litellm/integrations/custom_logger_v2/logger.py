@@ -84,6 +84,7 @@ class CustomLoggerV2:
     _own_subscriptions: ClassVar[Mapping[Hook, Subscription]] = MappingProxyType({})
     subscriptions: ClassVar[Mapping[Hook, Subscription]] = MappingProxyType({})
     request_state: ClassVar[type | None] = None
+    declared_hooks: ClassVar[frozenset[Hook]] = frozenset()
 
     selection: Selection | None = None
     enabled_hooks: frozenset[Hook] | None = None
@@ -105,3 +106,4 @@ class CustomLoggerV2:
         if problems:
             raise InvalidDeclarationError(f"{cls.__name__}: {'; '.join(problems)}")
         cls.subscriptions = resolved
+        CustomLoggerV2.declared_hooks = CustomLoggerV2.declared_hooks | resolved.keys()
