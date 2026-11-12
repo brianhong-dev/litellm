@@ -184,7 +184,7 @@ class KwargsFields(LiveFields):
             raise InvalidPatchError(f"{field.value} holds no mapping here, so keys cannot be merged into it")
         _update(current, keys)
 
-    def _target(self, field: Field) -> MutableMapping[str, object]:
+    def _target(self, field: Field) -> MutableMapping[str, object]:  # mutable-ok: legacy kwargs are the live request
         if field not in self._keys:
             raise InvalidPatchError(f"{field.value} has no place in the legacy kwargs of this hook")
         if not isinstance(self._kwargs, MutableMapping):
@@ -196,11 +196,16 @@ def _mapping_value(mapping: Mapping[object, object], key: str) -> object:
     return mapping[key]
 
 
-def _string_keyed(mapping: MutableMapping[str, object]) -> MutableMapping[str, object]:
+def _string_keyed(
+    mapping: MutableMapping[str, object],  # mutable-ok: legacy kwargs are the live request
+) -> MutableMapping[str, object]:  # mutable-ok: same object handed back
     return mapping
 
 
-def _update(target: MutableMapping[str, object], keys: Mapping[str, object]) -> None:
+def _update(
+    target: MutableMapping[str, object],  # mutable-ok: legacy kwargs are merged in place, as legacy hooks do
+    keys: Mapping[str, object],
+) -> None:
     target.update(keys)
 
 

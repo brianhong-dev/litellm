@@ -4,6 +4,7 @@ import logging
 from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from itertools import chain
 from operator import itemgetter
 from types import TracebackType
 from typing import Final, Generic, Protocol, TypeAlias, TypeVar
@@ -137,9 +138,9 @@ async def run_legacy_plan(
         for entry in stage:
             result = await _run_legacy(entry, binding, current)
             if isinstance(result, Patch):
-                current = apply_patch(current, result)  # rebind-ok: same as above
+                current = apply_patch(current, result)
     if between is not None:
-        current = await between(current)  # rebind-ok: the host step may replace the kwargs
+        current = await between(current)
     for stage in parallel:
         started = tuple(_legacy_start(entry, binding, current) for entry in stage)
         results = await _gather_started(started, _fail_fast(hook, stage))
@@ -154,13 +155,14 @@ async def run_legacy_plan(
 def run_legacy_plan_sync(
     plan: HookPlan, fields: Mapping[Field, object], binding: SyncBinding
 ) -> Mapping[Field, object]:
-    if any(entry.subscription.parallel for stage in plan.stages for entry in stage):
+    staged: Final = tuple(chain.from_iterable(plan.stages))
+    if any(entry.subscription.parallel for entry in staged):
         raise ContractViolation("a synchronous hook cannot run parallel legacy entries")
     current: Mapping[Field, object] = fields  # rebind-ok: each legacy entry may replace the kwargs
-    for entry in (*(entry for stage in plan.stages for entry in stage), *plan.inline):
+    for entry in (*staged, *plan.inline):
         result = _legacy_start(entry, binding, current)
         if isinstance(result, Patch):
-            current = apply_patch(current, result)  # rebind-ok: same as above
+            current = apply_patch(current, result)
     return current
 
 
@@ -276,7 +278,7 @@ class RequestScope:
         call: CallFacts | None,
         binding: SyncBinding,
     ) -> Mapping[Field, object]:
-        natives: Final = tuple(entry for stage in plan.stages for entry in stage if not entry.subscription.legacy)
+        natives: Final = tuple(entry for entry in chain.from_iterable(plan.stages) if not entry.subscription.legacy)
         if natives or plan.awaited:
             raise ContractViolation(f"{hook.value} runs synchronously here, so only off-path natives may subscribe")
         result: Final = run_legacy_plan_sync(plan, fields, binding)
