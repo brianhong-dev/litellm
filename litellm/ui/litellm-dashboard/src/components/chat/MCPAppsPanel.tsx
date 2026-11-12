@@ -366,10 +366,9 @@ const MCPAppsPanel: React.FC<Props> = ({
     [servers, selectedServers, connectUnavailabilityLabel],
   );
   const connectedCount = connectedServerIds.length;
-  const selectionKnown = !loading && !loadFailed && oauthChecking.size === 0;
   useEffect(() => {
-    if (selectionKnown) onConnectedServerIds?.(connectedServerIds);
-  }, [selectionKnown, connectedServerIds, onConnectedServerIds]);
+    if (!loading && !loadFailed && oauthChecking.size === 0) onConnectedServerIds?.(connectedServerIds);
+  }, [loading, loadFailed, oauthChecking.size, connectedServerIds, onConnectedServerIds]);
 
   const emptyStateText = () => {
     if (loadFailed) return t("chat.mcpAppsPanel.empty.loadFailed");
