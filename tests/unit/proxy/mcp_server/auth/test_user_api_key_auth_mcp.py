@@ -1663,12 +1663,16 @@ class TestMCPOAuth2AuthFlow:
     as LiteLLM API keys, causing auth failures and empty tool listings.
     """
 
-    async def test_oauth2_upstream_token_on_legacy_delegate_is_admitted_anonymously(self) -> None:
+    async def test_oauth2_upstream_token_on_legacy_delegate_is_admitted_anonymously(
+        self, build_proxy_auth_settings: Callable[[], None]
+    ) -> None:
         """
         A bare upstream OAuth token on the legacy delegated mode is admitted
         anonymously without LiteLLM key validation and kept for egress.
         """
         from litellm.types.mcp import MCPAuth
+
+        build_proxy_auth_settings()
 
         scope = {
             "type": "http",
@@ -2552,6 +2556,10 @@ class TestMCPDelegateAuthToUpstream:
     when that user is granted the server, else anonymously.
     """
 
+    @pytest.fixture(autouse=True)
+    def _proxy_auth_settings(self, build_proxy_auth_settings: Callable[[], None]) -> None:
+        build_proxy_auth_settings()
+
     @staticmethod
     def _make_server(auth_type, delegate_auth_to_upstream=False):
         from litellm.types.mcp_server.mcp_server_manager import MCPServer
@@ -2697,8 +2705,8 @@ class TestMCPDelegateAuthToUpstream:
             patch.dict(proxy_server.general_settings, {"enable_jwt_auth": True}),
             patch.object(proxy_server, "premium_user", True),
             patch.object(proxy_server, "user_custom_auth", None),
-            patch.object(proxy_server.jwt_handler, "auth_jwt", auth_jwt),
-            patch.object(proxy_server.jwt_handler, "litellm_jwtauth", LiteLLM_JWTAuth(), create=True),
+            patch.object(proxy_server, "litellm_jwtauth", LiteLLM_JWTAuth()),
+            patch("litellm.proxy.auth.jwt.verify", auth_jwt),
             patch.dict(os.environ),
         ):
             os.environ.pop("JWT_ISSUER", None)
@@ -2927,7 +2935,10 @@ class TestMCPDelegateAuthToUpstream:
     @staticmethod
     @contextlib.contextmanager
     def _idp_auth_enabled(
-        mechanism: Literal["oauth2", "oauth2_proxy"], verify: AsyncMock, premium: bool = True
+        mechanism: Literal["oauth2", "oauth2_proxy"],
+        verify: AsyncMock,
+        build_settings: Callable[[], None],
+        premium: bool = True,
     ) -> Iterator[None]:
         from litellm.proxy import proxy_server
         from litellm.proxy.auth.oauth2_check import Oauth2Handler
@@ -2944,6 +2955,7 @@ class TestMCPDelegateAuthToUpstream:
             patch.object(proxy_server, "user_custom_auth", None),
             verifier,
         ):
+            build_settings()
             yield
 
     @pytest.mark.parametrize(
@@ -2960,12 +2972,15 @@ class TestMCPDelegateAuthToUpstream:
         verify_effect: Exception | None,
         allowed_server_ids: Sequence[str],
         expected_user_id: str | None,
+        build_proxy_auth_settings: Callable[[], None],
     ) -> None:
         """Trusted reverse-proxy headers admit a granted user by name, and a user who is not granted or not
         vouched for anonymously. The bearer is forwarded either way."""
         admission: Final = AsyncMock(return_value=UserAPIKeyAuth(user_id="idp-user"))
         with (
-            TestMCPDelegateAuthToUpstream._idp_auth_enabled("oauth2_proxy", AsyncMock(side_effect=verify_effect)),
+            TestMCPDelegateAuthToUpstream._idp_auth_enabled(
+                "oauth2_proxy", AsyncMock(side_effect=verify_effect), build_proxy_auth_settings
+            ),
             TestMCPDelegateAuthToUpstream._delegate_admission(admission, allowed_server_ids),
         ):
             auth_result, _, _, _, oauth2_headers, _ = await MCPRequestHandler.process_mcp_request(
@@ -2987,7 +3002,12 @@ class TestMCPDelegateAuthToUpstream:
         ids=["granted-user", "user-not-granted", "token-inactive", "provider-rejects-token"],
     )
     async def test_delegate_oauth2_introspects_once_and_follows_the_jwt_rules(
-        self, provider_status: int, active: bool, allowed_server_ids: Sequence[str], expected_user_id: str | None
+        self,
+        provider_status: int,
+        active: bool,
+        allowed_server_ids: Sequence[str],
+        expected_user_id: str | None,
+        build_proxy_auth_settings: Callable[[], None],
     ) -> None:
         """The provider is asked about the token once per request. A token it vouches for admits a granted
         user by name, and one it reports inactive or rejects outright is forwarded anonymously instead of
@@ -3018,6 +3038,7 @@ class TestMCPDelegateAuthToUpstream:
             patch("httpx.AsyncClient.send", side_effect=introspect) as network,
             patch("litellm.proxy.mcp_server.mcp_server_manager.global_mcp_server_manager") as mock_mgr,
         ):
+            build_proxy_auth_settings()
             mock_mgr.get_mcp_server_by_name.return_value = TestMCPDelegateAuthToUpstream._make_server(
                 auth_type=MCPAuth.oauth2, delegate_auth_to_upstream=True
             )
@@ -3031,13 +3052,15 @@ class TestMCPDelegateAuthToUpstream:
         assert auth_result.mcp_forwards_caller_authorization is True
         assert oauth2_headers == {"Authorization": "Bearer opaque-idp-token"}
 
-    async def test_delegate_oauth2_rejection_admits_anonymously_whether_or_not_auth_wraps_it(self) -> None:
+    async def test_delegate_oauth2_rejection_admits_anonymously_whether_or_not_auth_wraps_it(
+        self, build_proxy_auth_settings: Callable[[], None]
+    ) -> None:
         """A provider rejection is the provider declining to vouch, so the bearer is forwarded anonymously
         even when it reaches admission as the bare validation error rather than a wrapped auth error."""
         from litellm.proxy.auth.oauth2_check import OAuth2TokenValidationError
 
         with (
-            TestMCPDelegateAuthToUpstream._idp_auth_enabled("oauth2", AsyncMock()),
+            TestMCPDelegateAuthToUpstream._idp_auth_enabled("oauth2", AsyncMock(), build_proxy_auth_settings),
             TestMCPDelegateAuthToUpstream._delegate_admission(
                 AsyncMock(side_effect=OAuth2TokenValidationError("Token is not active"))
             ),
@@ -3051,13 +3074,15 @@ class TestMCPDelegateAuthToUpstream:
         assert oauth2_headers == {"Authorization": "Bearer opaque-idp-token"}
 
     @pytest.mark.parametrize("mechanism", ["oauth2", "oauth2_proxy"])
-    async def test_delegate_idp_user_refusal_propagates(self, mechanism: Literal["oauth2", "oauth2_proxy"]) -> None:
+    async def test_delegate_idp_user_refusal_propagates(
+        self, mechanism: Literal["oauth2", "oauth2_proxy"], build_proxy_auth_settings: Callable[[], None]
+    ) -> None:
         """Once the provider vouches for the caller, LiteLLM's budget and permission refusals apply."""
         refusal: Final = ProxyException(
             message="Budget has been exceeded", type="budget_exceeded", param=None, code=400
         )
         with (
-            TestMCPDelegateAuthToUpstream._idp_auth_enabled(mechanism, AsyncMock()),
+            TestMCPDelegateAuthToUpstream._idp_auth_enabled(mechanism, AsyncMock(), build_proxy_auth_settings),
             TestMCPDelegateAuthToUpstream._delegate_admission(AsyncMock(side_effect=refusal)),
         ):
             with pytest.raises(ProxyException) as exc_info:
@@ -3067,11 +3092,15 @@ class TestMCPDelegateAuthToUpstream:
 
         assert exc_info.value is refusal
 
-    async def test_delegate_oauth2_without_premium_never_calls_the_provider(self) -> None:
+    async def test_delegate_oauth2_without_premium_never_calls_the_provider(
+        self, build_proxy_auth_settings: Callable[[], None]
+    ) -> None:
         """OAuth2 introspection is enterprise-only, so without a license the bearer is the upstream's alone."""
         introspect: Final = AsyncMock()
         with (
-            TestMCPDelegateAuthToUpstream._idp_auth_enabled("oauth2", introspect, premium=False),
+            TestMCPDelegateAuthToUpstream._idp_auth_enabled(
+                "oauth2", introspect, build_proxy_auth_settings, premium=False
+            ),
             TestMCPDelegateAuthToUpstream._delegate_admission(
                 AsyncMock(return_value=UserAPIKeyAuth(user_id="idp-user"))
             ),

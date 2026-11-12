@@ -1,3 +1,4 @@
+mod auth;
 mod cache;
 mod callable;
 mod coercion;
@@ -25,6 +26,19 @@ mod _native {
     use litellm_host_python::{ForkedAfterNativeRuntimeStarted, ProcessReservedForForking};
     use pyo3::{prelude::*, types::PyModule};
 
+    #[pymodule_export]
+    use crate::auth::{
+        AuthCall, AuthOutcome, AuthSettings, AuthStep, ClaimIdentityView, DenialView, IdentityView,
+        KeyContextView, MappedClaimsView, MappingView, PlanView, TeamGrantView, jwt_claims,
+        jwt_is_allowed_domain, jwt_is_jwt, jwt_key_mapping_cache_key, jwt_presents_claims,
+        jwt_unverified_claims,
+    };
+    #[pymodule_export]
+    use crate::auth::{
+        auth_allowed_routes_grant, auth_first_denied_route,
+        auth_jwt_team_routes_grant, auth_managed_agent_route_allowed, auth_managed_route,
+        auth_route_matches_denied, auth_route_matches_prefix, auth_route_matches_wildcard,
+    };
     #[pymodule_export]
     use crate::db::NativeDatabase;
     #[cfg(feature = "panic-test")]
@@ -102,6 +116,10 @@ mod _native {
     #[pymodule_init]
     fn init(module: &Bound<'_, PyModule>) -> PyResult<()> {
         let _ = rustls::crypto::ring::default_provider().install_default();
+        module.add(
+            "JWT_ID_JAG_TYP",
+            litellm_gateway_auth_core::credential::jwt::ID_JAG_TYP,
+        )?;
         let py = module.py();
         let dict = module.dict();
         dict.set_item(
