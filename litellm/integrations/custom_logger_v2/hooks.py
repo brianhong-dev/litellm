@@ -23,6 +23,7 @@ class HookSpec:
     legacy_guardrail_events: frozenset[LegacyGuardrailEvent] = frozenset()
     has_call: bool = True
     subscribable: bool = True
+    fail_fast_parallel: bool = False
 
 
 _NO_OUTCOME: Final[frozenset[OutcomeType]] = frozenset()
@@ -73,6 +74,7 @@ HOOK_SPECS: Final[Mapping[Hook, HookSpec]] = MappingProxyType(
             request_path=True,
             outcomes=_ABORT_OR_RESPOND,
             legacy_guardrail_events=frozenset({"during_call"}),
+            fail_fast_parallel=True,
         ),
         Hook.pre_deployment_call: HookSpec(
             legacy_methods=("async_pre_call_deployment_hook", "async_pre_request_hook"),
@@ -184,6 +186,7 @@ class Subscription:
     parallel: bool = False
     awaited: bool = False
     activation: Activation | None = None
+    legacy: bool = False
 
     def __post_init__(self) -> None:
         problem: Final = subscription_problem(self)
@@ -195,7 +198,8 @@ def subscription_problem(subscription: Subscription) -> str | None:
     spec: Final = HOOK_SPECS[subscription.hook]
     if not spec.subscribable:
         return "this hook point has no V2 subscription support yet"
-    forbidden: Final = subscription.writes - spec.writes
+    legacy_writes: Final = frozenset({Field.deprecated_kwargs}) if subscription.legacy else frozenset[Field]()
+    forbidden: Final = subscription.writes - spec.writes - legacy_writes
     if forbidden:
         return f"writes {', '.join(sorted(field.value for field in forbidden))}, which this hook point cannot apply"
     if subscription.may_abort and not spec.outcomes:

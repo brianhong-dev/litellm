@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from functools import reduce
 from typing import Final
 
-from litellm.integrations.custom_logger_v2.enums import Activation, Field
+from litellm.integrations.custom_logger_v2.enums import Activation, Field, field_mask
 from litellm.integrations.custom_logger_v2.hooks import Subscription
 from litellm.integrations.custom_logger_v2.manifest import CallbackManifest
 
@@ -22,6 +22,7 @@ class Entry:
 @dataclass(frozen=True, slots=True)
 class HookPlan:
     stages: tuple[tuple[Entry, ...], ...] = ()
+    inline: tuple[Entry, ...] = ()
     awaited: tuple[Entry, ...] = ()
     off_path: tuple[Entry, ...] = ()
     reads: frozenset[Field] = frozenset()
@@ -37,9 +38,10 @@ def _blocks(subscription: Subscription) -> bool:
 def _level(placed: tuple[tuple[Subscription, int], ...], subscription: Subscription) -> int:
     if subscription.may_abort:
         return max((level for _, level in placed), default=-1) + 1
-    touched: Final = subscription.reads | subscription.writes
-    after_writers: Final = tuple(level + 1 for prior, level in placed if prior.writes & touched)
-    not_before_readers: Final = tuple(level for prior, level in placed if prior.reads & subscription.writes)
+    touched: Final = field_mask(subscription.reads | subscription.writes)
+    writes: Final = field_mask(subscription.writes)
+    after_writers: Final = tuple(level + 1 for prior, level in placed if field_mask(prior.writes) & touched)
+    not_before_readers: Final = tuple(level for prior, level in placed if field_mask(prior.reads) & writes)
     return max((*after_writers, *not_before_readers), default=0)
 
 
@@ -68,7 +70,8 @@ def plan_hook(entries: Sequence[Entry]) -> HookPlan:
     passive: Final = tuple(entry for entry in entries if not _blocks(entry.subscription))
     return HookPlan(
         stages=(*_levels(serial), *((parallel,) if parallel else ())),
-        awaited=tuple(entry for entry in passive if entry.subscription.awaited),
-        off_path=tuple(entry for entry in passive if not entry.subscription.awaited),
+        inline=tuple(entry for entry in passive if entry.subscription.legacy),
+        awaited=tuple(entry for entry in passive if entry.subscription.awaited and not entry.subscription.legacy),
+        off_path=tuple(entry for entry in passive if not (entry.subscription.awaited or entry.subscription.legacy)),
         reads=frozenset[Field]().union(*(entry.subscription.reads for entry in entries)),
     )

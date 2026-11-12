@@ -1,12 +1,22 @@
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from types import MappingProxyType
-from typing import Final
+from typing import Final, Protocol, TypeAlias, TypeVar
 
-from litellm.integrations.custom_logger_v2.enums import Activation, Hook, OptOutBy
+from litellm.integrations.custom_logger_v2.enums import Activation, Field, Hook, OptOutBy
 from litellm.integrations.custom_logger_v2.hooks import InvalidDeclarationError, Subscription
 from litellm.integrations.custom_logger_v2.logger import CustomLoggerV2
 from litellm.integrations.custom_logger_v2.selection import Selection
+
+ResultT: Final = TypeVar("ResultT")
+
+LegacyBinding: TypeAlias = Callable[[object, object], Awaitable[object] | None]
+
+
+class LegacyCall(Protocol):
+    def __call__(
+        self, binding: Callable[[object, object], ResultT], fields: Mapping[Field, object], /
+    ) -> ResultT | None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -15,6 +25,7 @@ class CallbackManifest:
     selection: Selection
     subscriptions: Mapping[Hook, Subscription]
     request_state: type | None
+    legacy_call: LegacyCall | None = None
 
 
 def _instance_subscription(subscription: Subscription, parallel: bool, activation: Activation | None) -> Subscription:

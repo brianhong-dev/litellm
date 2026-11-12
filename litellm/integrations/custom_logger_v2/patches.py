@@ -1,3 +1,4 @@
+from abc import abstractmethod
 from collections.abc import Iterable, Iterator, Mapping
 from functools import reduce
 from types import MappingProxyType
@@ -9,6 +10,13 @@ from litellm.integrations.custom_logger_v2.enums import Field
 from litellm.integrations.custom_logger_v2.outcomes import InvalidPatchError, MergeField, Patch, PatchOp, SetField
 
 _STRING_KEYED: Final = TypeAdapter(Mapping[str, object])
+
+
+class LiveFields(Mapping[Field, object]):
+    __slots__ = ()
+
+    @abstractmethod
+    def apply(self, patch: Patch) -> Mapping[Field, object]: ...
 
 
 class PatchedFields(Mapping[Field, object]):
@@ -53,6 +61,8 @@ def _apply_op(fields: Mapping[Field, object], op: PatchOp) -> Mapping[Field, obj
 
 
 def apply_patch(fields: Mapping[Field, object], patch: Patch) -> Mapping[Field, object]:
+    if isinstance(fields, LiveFields):
+        return fields.apply(patch)
     return reduce(_apply_op, patch.ops, fields)
 
 

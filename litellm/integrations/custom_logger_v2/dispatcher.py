@@ -13,9 +13,11 @@ from typing_extensions import Self
 from litellm.integrations.custom_logger_v2.call import CallContext, CallFacts
 from litellm.integrations.custom_logger_v2.enforcement import ContractViolation, Enforced, Policy, Unchecked
 from litellm.integrations.custom_logger_v2.enums import Field, Hook
+from litellm.integrations.custom_logger_v2.hooks import HOOK_SPECS
+from litellm.integrations.custom_logger_v2.manifest import LegacyBinding
 from litellm.integrations.custom_logger_v2.offpath import InProcessSink, OffPathSink
 from litellm.integrations.custom_logger_v2.outcomes import Abort, Outcome, Patch, Reroute, Respond
-from litellm.integrations.custom_logger_v2.patches import apply_patches
+from litellm.integrations.custom_logger_v2.patches import apply_patch, apply_patches
 from litellm.integrations.custom_logger_v2.planner import EMPTY_PLAN, Entry, HookPlan
 from litellm.integrations.custom_logger_v2.registry import CallbackRegistry, RegistrySnapshot
 from litellm.integrations.custom_logger_v2.selection import RequestSelection, is_selected
@@ -23,6 +25,8 @@ from litellm.integrations.custom_logger_v2.selection import RequestSelection, is
 LegacyT: Final = TypeVar("LegacyT")
 
 LegacyGroup: TypeAlias = Callable[[tuple[Patch, ...]], Awaitable[LegacyT]]
+Between: TypeAlias = Callable[[Mapping[Field, object]], Awaitable[Mapping[Field, object]]]
+SyncBinding: TypeAlias = Callable[[object, object], object]
 
 SWALLOWING_HOOKS: Final = frozenset({Hook.response_headers, Hook.post_call_failure})
 
@@ -82,6 +86,84 @@ def _fatal(error: BaseException) -> bool:
     return isinstance(error, ContractViolation) or not isinstance(error, Exception)
 
 
+def _split(
+    stages: tuple[tuple[Entry, ...], ...],
+) -> tuple[tuple[tuple[Entry, ...], ...], tuple[tuple[Entry, ...], ...]]:
+    if stages and stages[-1][0].subscription.parallel:
+        return stages[:-1], stages[-1:]
+    return stages, ()
+
+
+def _legacy_start(
+    entry: Entry, binding: Callable[[object, object], LegacyT] | None, fields: Mapping[Field, object]
+) -> LegacyT | None:
+    call: Final = entry.manifest.legacy_call
+    if call is None or binding is None:
+        raise ContractViolation(
+            f"{entry.manifest.selection.name} is a legacy entry, so the call site must pass a binding"
+        )
+    return call(binding, fields)
+
+
+async def _run_legacy(entry: Entry, binding: LegacyBinding | None, fields: Mapping[Field, object]) -> object:
+    started: Final = _legacy_start(entry, binding, fields)
+    return None if started is None else await started
+
+
+async def _gather_started(started: tuple[Awaitable[object] | None, ...], fail_fast: bool) -> tuple[object, ...]:
+    pending: Final = tuple(run for run in started if run is not None)
+    if not pending:
+        return tuple(None for _ in started)
+    done: Final = iter(
+        await asyncio.gather(*pending) if fail_fast else await asyncio.gather(*pending, return_exceptions=True)
+    )
+    return tuple(None if run is None else next(done) for run in started)
+
+
+def _fail_fast(hook: Hook, stage: tuple[Entry, ...]) -> bool:
+    return HOOK_SPECS[hook].fail_fast_parallel and all(entry.subscription.parallel for entry in stage)
+
+
+async def run_legacy_plan(
+    hook: Hook,
+    plan: HookPlan,
+    fields: Mapping[Field, object],
+    binding: LegacyBinding,
+    between: Between | None = None,
+) -> Mapping[Field, object]:
+    serial, parallel = _split(plan.stages)
+    current: Mapping[Field, object] = fields  # rebind-ok: each legacy entry may replace the kwargs
+    for stage in serial:
+        for entry in stage:
+            result = await _run_legacy(entry, binding, current)
+            if isinstance(result, Patch):
+                current = apply_patch(current, result)  # rebind-ok: same as above
+    if between is not None:
+        current = await between(current)  # rebind-ok: the host step may replace the kwargs
+    for stage in parallel:
+        started = tuple(_legacy_start(entry, binding, current) for entry in stage)
+        results = await _gather_started(started, _fail_fast(hook, stage))
+        failure = next((result for result in results if isinstance(result, BaseException)), None)
+        if failure is not None:
+            raise failure
+    for entry in plan.inline:
+        _ = await _run_legacy(entry, binding, current)
+    return current
+
+
+def run_legacy_plan_sync(
+    plan: HookPlan, fields: Mapping[Field, object], binding: SyncBinding
+) -> Mapping[Field, object]:
+    if any(entry.subscription.parallel for stage in plan.stages for entry in stage):
+        raise ContractViolation("a synchronous hook cannot run parallel legacy entries")
+    current: Mapping[Field, object] = fields  # rebind-ok: each legacy entry may replace the kwargs
+    for entry in (*(entry for stage in plan.stages for entry in stage), *plan.inline):
+        result = _legacy_start(entry, binding, current)
+        if isinstance(result, Patch):
+            current = apply_patch(current, result)  # rebind-ok: same as above
+    return current
+
+
 class Dispatcher:
     def __init__(
         self,
@@ -121,15 +203,14 @@ class RequestScope:
     def close(self) -> None:
         self._states.clear()
 
+    def selects(self, entry: Entry) -> bool:
+        return is_selected(entry.manifest.selection, entry.activation, self._selection)
+
     def plan(self, hook: Hook) -> HookPlan:
         entries: Final = self._snapshot.entries[hook]
         if not entries:
             return EMPTY_PLAN
-        selected: Final = tuple(
-            index
-            for index, entry in enumerate(entries)
-            if is_selected(entry.manifest.selection, entry.activation, self._selection)
-        )
+        selected: Final = tuple(index for index, entry in enumerate(entries) if self.selects(entry))
         return self._snapshot.plan(hook, selected) if selected else EMPTY_PLAN
 
     def reads(self, hook: Hook) -> frozenset[Field]:
@@ -145,7 +226,7 @@ class RequestScope:
         plan: Final = self.plan(hook)
         if plan is EMPTY_PLAN:
             return HookResult(fields=fields, legacy=None if legacy is None else await legacy(()))
-        chain: Final = await self._run_stages(hook, plan.stages, _Chain(fields=fields), call)
+        chain: Final = await self._run_stages(hook, plan.stages, _Chain(fields=fields), call, None)
         patches: Final = chain.ordered_patches
         if chain.terminal is not None:
             return HookResult(fields=chain.fields, patches=patches, outcome=chain.terminal)
@@ -156,6 +237,52 @@ class RequestScope:
         if chain.reroute is not None:
             self.reroute = chain.reroute
         return HookResult(fields=chain.fields, patches=patches, outcome=chain.reroute, legacy=legacy_result)
+
+    async def run_plan(
+        self,
+        hook: Hook,
+        plan: HookPlan,
+        fields: Mapping[Field, object],
+        call: CallFacts | None,
+        binding: LegacyBinding,
+        between: Between | None = None,
+    ) -> HookResult[None]:
+        serial, parallel = _split(plan.stages)
+        chain: Final = await self._run_stages(hook, serial, _Chain(fields=fields), call, binding)
+        if chain.terminal is not None:
+            return HookResult(fields=chain.fields, patches=chain.ordered_patches, outcome=chain.terminal)
+        joined: Final = (
+            chain
+            if between is None
+            else _Chain(fields=await between(chain.fields), patches=chain.patches, reroute=chain.reroute)
+        )
+        done: Final = await self._run_stages(hook, parallel, joined, call, binding)
+        if done.terminal is not None:
+            return HookResult(fields=done.fields, patches=done.ordered_patches, outcome=done.terminal)
+        for entry in plan.inline:
+            _ = await _run_legacy(entry, binding, done.fields)
+        await self._run_awaited(hook, plan.awaited, done.fields, call)
+        if plan.off_path:
+            self._dispatcher.sink.submit(self._deliver_off_path(hook, plan.off_path, done.fields, call))
+        if done.reroute is not None:
+            self.reroute = done.reroute
+        return HookResult(fields=done.fields, patches=done.ordered_patches, outcome=done.reroute)
+
+    def run_plan_sync(
+        self,
+        hook: Hook,
+        plan: HookPlan,
+        fields: Mapping[Field, object],
+        call: CallFacts | None,
+        binding: SyncBinding,
+    ) -> Mapping[Field, object]:
+        natives: Final = tuple(entry for stage in plan.stages for entry in stage if not entry.subscription.legacy)
+        if natives or plan.awaited:
+            raise ContractViolation(f"{hook.value} runs synchronously here, so only off-path natives may subscribe")
+        result: Final = run_legacy_plan_sync(plan, fields, binding)
+        if plan.off_path:
+            self._dispatcher.sink.submit(self._deliver_off_path(hook, plan.off_path, result, call))
+        return result
 
     def run_sync_hook(
         self,
@@ -176,9 +303,10 @@ class RequestScope:
         factory: Final = entry.manifest.request_state
         if factory is None:
             return None
-        if entry.position not in self._states:
-            self._states[entry.position] = factory()
-        return self._states[entry.position]
+        key: Final = id(entry.manifest.logger)
+        if key not in self._states:
+            self._states[key] = factory()
+        return self._states[key]
 
     async def _invoke(
         self, hook: Hook, entry: Entry, fields: Mapping[Field, object], call: CallFacts | None, state: object
@@ -195,25 +323,49 @@ class RequestScope:
         policy.check(entry.subscription, result)
         return result
 
+    def _start(
+        self,
+        hook: Hook,
+        entry: Entry,
+        fields: Mapping[Field, object],
+        call: CallFacts | None,
+        live: bool,
+        binding: LegacyBinding | None,
+    ) -> Awaitable[object] | None:
+        if entry.subscription.legacy:
+            return _legacy_start(entry, binding, fields)
+        return self._invoke(hook, entry, fields, call, self._state(entry) if live else None)
+
     async def _gather(
-        self, hook: Hook, entries: Sequence[Entry], fields: Mapping[Field, object], call: CallFacts | None, live: bool
+        self,
+        hook: Hook,
+        entries: Sequence[Entry],
+        fields: Mapping[Field, object],
+        call: CallFacts | None,
+        live: bool,
+        binding: LegacyBinding | None = None,
     ) -> tuple[object, ...]:
-        runs: Final = (
-            self._invoke(hook, entry, fields, call, self._state(entry) if live else None) for entry in entries
-        )
-        return tuple(await asyncio.gather(*runs, return_exceptions=True))
+        if len(entries) == 1 and entries[0].subscription.legacy:
+            return (await _run_legacy(entries[0], binding, fields),)
+        started: Final = tuple(self._start(hook, entry, fields, call, live, binding) for entry in entries)
+        return await _gather_started(started, _fail_fast(hook, tuple(entries)))
 
     async def _run_stages(
-        self, hook: Hook, stages: tuple[tuple[Entry, ...], ...], chain: _Chain, call: CallFacts | None
+        self,
+        hook: Hook,
+        stages: tuple[tuple[Entry, ...], ...],
+        chain: _Chain,
+        call: CallFacts | None,
+        binding: LegacyBinding | None,
     ) -> _Chain:
         if not stages:
             return chain
         stage: Final = stages[0]
-        results: Final = await self._gather(hook, stage, chain.fields, call, live=True)
+        results: Final = await self._gather(hook, stage, chain.fields, call, live=True, binding=binding)
         folded: Final = self._fold(hook, stage, results, chain)
         if folded.terminal is not None:
             return folded
-        return await self._run_stages(hook, stages[1:], folded, call)
+        return await self._run_stages(hook, stages[1:], folded, call, binding)
 
     def _fold(self, hook: Hook, stage: tuple[Entry, ...], results: tuple[object, ...], chain: _Chain) -> _Chain:
         pairs: Final = tuple(zip(stage, results, strict=True))
@@ -238,7 +390,7 @@ class RequestScope:
 
     def _count_failures(self, hook: Hook, pairs: Sequence[tuple[Entry, object]]) -> None:
         for entry, result in pairs:
-            if isinstance(result, BaseException):
+            if isinstance(result, BaseException) and not entry.subscription.legacy:
                 self._dispatcher.record_failure(entry, hook, result)
 
     def _swallow(self, hook: Hook, entries: Sequence[Entry], results: tuple[object, ...]) -> None:

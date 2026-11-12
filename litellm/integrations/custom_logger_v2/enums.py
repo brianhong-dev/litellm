@@ -86,3 +86,12 @@ class Activation(str, Enum):
 class OptOutBy(str, Enum):
     admin = "admin"
     caller = "caller"
+
+
+ALL_FIELDS_MASK: Final = sum(1 << field.bit for field in Field)
+
+
+def field_mask(fields: frozenset[Field]) -> int:
+    if Field.deprecated_kwargs in fields:
+        return ALL_FIELDS_MASK
+    return sum(1 << field.bit for field in fields)
