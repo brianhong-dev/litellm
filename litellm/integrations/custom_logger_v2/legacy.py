@@ -1,6 +1,7 @@
 import weakref
 from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
+from enum import Enum
 from functools import lru_cache, reduce
 from itertools import count
 from types import MappingProxyType
@@ -46,6 +47,14 @@ LINE_CACHE_SIZE: Final = 128
 PLAN_CACHE_SIZE: Final = 64
 
 _SERIALS: Final = count()
+
+
+class Admit(str, Enum):
+    overriders = "overriders"
+    every_logger = "every_logger"
+    every_entry = "every_entry"
+
+
 _ABSENT: Final = object()
 _NO_SELECTION: Final = RequestSelection()
 
@@ -104,9 +113,9 @@ class LegacyLogger(CustomLoggerV2):
     def inner(self) -> CustomLogger | None:
         return self._inner()
 
-    def subscription(self, hook: Hook, every_logger: bool) -> Subscription | None:
+    def subscription(self, hook: Hook, admit: Admit) -> Subscription | None:
         derived: Final = self.manifest.subscriptions.get(hook)
-        if derived is not None or not every_logger or not HOOK_SPECS[hook].subscribable:
+        if derived is not None or admit is Admit.overriders or not HOOK_SPECS[hook].subscribable:
             return derived
         return legacy_subscription(hook, self.parallel and hook in PARALLEL_GUARDRAIL_HOOKS)
 
@@ -137,6 +146,22 @@ def _writable(
     value: object,
 ) -> TypeIs[MutableMapping[str, object]]:  # guard-ok: legacy kwargs are an untyped dict  # mutable-ok: written in place
     return isinstance(value, MutableMapping)
+
+
+class OpaqueLegacy(CustomLoggerV2):
+    def __init__(self, inner: object, hook: Hook) -> None:
+        self.inner: Final = inner
+        self.serial: Final = next(_SERIALS)
+        self.manifest: Final = CallbackManifest(
+            logger=self,
+            selection=Selection(name=type(inner).__name__, activation=Activation.required),
+            subscriptions=MappingProxyType({hook: legacy_subscription(hook, False)}),
+            request_state=None,
+            legacy_call=self.call,
+        )
+
+    def call(self, binding: Callable[[object, object], ResultT], fields: Mapping[Field, object]) -> ResultT | None:
+        return binding(self.inner, fields[Field.deprecated_kwargs])
 
 
 class KwargsFields(LiveFields):
@@ -231,12 +256,8 @@ class HookLine:
     plans: Callable[[tuple[int, ...]], HookPlan]
 
     @property
-    def legacy(self) -> tuple[CustomLogger, ...]:
-        return tuple(
-            inner
-            for entry in self.entries
-            if isinstance(entry.manifest.logger, LegacyLogger) and (inner := entry.manifest.logger.inner) is not None
-        )
+    def legacy(self) -> tuple[object, ...]:
+        return tuple(inner for entry in self.entries if (inner := _wrapped(entry.manifest.logger)) is not None)
 
     def plan_for(self, scope: RequestScope) -> HookPlan:
         selected: Final = tuple(
@@ -245,31 +266,42 @@ class HookLine:
         return self.plan if len(selected) == len(self.entries) else self.plans(selected)
 
 
+def _wrapped(logger: CustomLoggerV2) -> object:
+    if isinstance(logger, LegacyLogger | OpaqueLegacy):
+        return logger.inner
+    return None
+
+
 def _native_entry(native: CustomLoggerV2, hook: Hook) -> tuple[CallbackManifest, Subscription] | None:
     manifest: Final = build_manifest(native)
     subscription: Final = manifest.subscriptions.get(hook)
     return None if subscription is None else (manifest, subscription)
 
 
-def _legacy_entry(inner: CustomLogger, hook: Hook, every_logger: bool) -> tuple[CallbackManifest, Subscription] | None:
+def _legacy_entry(inner: CustomLogger, hook: Hook, admit: Admit) -> tuple[CallbackManifest, Subscription] | None:
     adapter: Final = adapter_for(inner)
-    subscription: Final = adapter.subscription(hook, every_logger)
+    subscription: Final = adapter.subscription(hook, admit)
     return None if subscription is None else (adapter.manifest, subscription)
 
 
-def _line_member(
-    item: object, hook: Hook, every_logger: bool, natives: bool
-) -> tuple[CallbackManifest, Subscription] | None:
+def _opaque_entry(item: object, hook: Hook) -> tuple[CallbackManifest, Subscription] | None:
+    if not HOOK_SPECS[hook].subscribable:
+        return None
+    opaque: Final = OpaqueLegacy(item, hook)
+    return opaque.manifest, opaque.manifest.subscriptions[hook]
+
+
+def _line_member(item: object, hook: Hook, admit: Admit, natives: bool) -> tuple[CallbackManifest, Subscription] | None:
     if isinstance(item, CustomLoggerV2):
         return _native_entry(item, hook) if natives else None
     if isinstance(item, CustomLogger):
-        return _legacy_entry(item, hook, every_logger)
-    return None
+        return _legacy_entry(item, hook, admit)
+    return _opaque_entry(item, hook) if admit is Admit.every_entry else None
 
 
-def _build_line(hook: Hook, callbacks: Sequence[object], every_logger: bool, natives: bool) -> HookLine:
+def _build_line(hook: Hook, callbacks: Sequence[object], admit: Admit, natives: bool) -> HookLine:
     members: Final = tuple(
-        member for item in callbacks if (member := _line_member(item, hook, every_logger, natives)) is not None
+        member for item in callbacks if (member := _line_member(item, hook, admit, natives)) is not None
     )
     entries: Final = tuple(
         Entry(position, manifest, subscription) for position, (manifest, subscription) in enumerate(members)
@@ -309,12 +341,14 @@ def _cache_line(key: tuple[object, ...], line: HookLine, callbacks: Sequence[obj
             _ = weakref.finalize(item, _LINES.pop, key, None)
 
 
-def hook_line(hook: Hook, callbacks: Sequence[object], *, every_logger: bool = False, natives: bool = True) -> HookLine:
-    key: Final = (hook, every_logger, natives, *map(id, callbacks))
+def hook_line(
+    hook: Hook, callbacks: Sequence[object], *, admit: Admit = Admit.overriders, natives: bool = True
+) -> HookLine:
+    key: Final = (hook, admit, natives, *map(id, callbacks))
     cached: Final = _LINES.get(key)
     if cached is not None:
         return cached.line
-    line: Final = _build_line(hook, callbacks, every_logger, natives)
+    line: Final = _build_line(hook, callbacks, admit, natives)
     _cache_line(key, line, callbacks)
     return line
 

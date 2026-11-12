@@ -20,6 +20,7 @@ from litellm.integrations.custom_logger_v2 import (
 from litellm.integrations.custom_logger_v2.host import reset_host_for_tests
 from litellm.integrations.custom_logger_v2.legacy import (
     PROXY_REQUEST_KEYS,
+    Admit,
     KwargsFields,
     adapter_for,
     clear_line_cache_for_tests,
@@ -140,7 +141,7 @@ def test_every_logger_admits_loggers_that_do_not_override_the_hook() -> None:
     exporter: Final = Exporter()
 
     assert hook_line(Hook.pre_call, [exporter]).entries == ()
-    assert len(hook_line(Hook.pre_call, [exporter], every_logger=True).entries) == 1
+    assert len(hook_line(Hook.pre_call, [exporter], admit=Admit.every_logger).entries) == 1
 
 
 def test_adapters_are_cached_per_instance_and_dropped_with_it() -> None:
@@ -309,3 +310,21 @@ def test_sync_lines_reject_a_blocking_native() -> None:
 
     with pytest.raises(ContractViolation, match="synchronously"):
         run_line_sync(line, KwargsFields({}, {}), lambda logger, data: None)
+
+
+def test_every_entry_keeps_string_and_callable_callbacks_in_list_order() -> None:
+    journal: Final[list[object]] = []
+
+    def plain_callback() -> None:
+        return None
+
+    exporter: Final = Exporter()
+    callbacks: Final[list[object]] = ["langfuse", plain_callback, exporter]
+
+    def start(logger: object, data: object) -> None:
+        journal.append(logger)
+
+    run_line_sync(hook_line(Hook.attempt_ended, callbacks, admit=Admit.every_entry), KwargsFields({}, {}), start)
+
+    assert journal == ["langfuse", plain_callback, exporter]
+    assert hook_line(Hook.attempt_ended, callbacks).legacy == (exporter,)
