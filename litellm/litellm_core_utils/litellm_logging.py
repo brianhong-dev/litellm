@@ -2139,10 +2139,11 @@ class Logging(LiteLLMLoggingBaseClass):
             )
             if response is not None:
                 run.hidden_params = response.hidden_params
-            return hook_content
         except Exception as e:
             verbose_logger.exception("LiteLLM.LoggingError: [Non-Blocking] Exception occurred while logging %s", e)
             return None
+        else:
+            return hook_content
 
     def _parse_post_mcp_call_hook_response(
         self, response: MCPPostCallResponseObject | None
