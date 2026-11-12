@@ -158,8 +158,20 @@ from litellm.integrations.custom_guardrail import (
     merged_guardrail_entries,
 )
 from litellm.integrations.custom_logger import CustomLogger, overrides_hook
-from litellm.integrations.custom_logger_v2.enums import Hook
+from litellm.integrations.custom_logger_v2.enums import Field, Hook
 from litellm.integrations.custom_logger_v2.host import run_legacy_hook
+from litellm.integrations.custom_logger_v2.legacy import (
+    PROXY_REQUEST_KEYS,
+    KwargsFields,
+    adapter_for,
+    hook_line,
+    kwargs_after,
+    kwargs_patch,
+    run_line,
+)
+from litellm.integrations.custom_logger_v2.logger import CustomLoggerV2
+from litellm.integrations.custom_logger_v2.outcomes import Patch
+from litellm.integrations.custom_logger_v2.patches import apply_patch
 from litellm.integrations.prometheus import PrometheusLogger
 from litellm.integrations.SlackAlerting.slack_alerting import SlackAlerting
 from litellm.integrations.SlackAlerting.utils import add_langfuse_trace_id_to_alert
@@ -1889,6 +1901,8 @@ class _CallbackCapabilities:
     # avoids the per-request ``get_custom_logger_compatible_class`` walk for
     # every string entry in ``litellm.callbacks``.
     resolved_callbacks: tuple[object, ...] = field(default_factory=tuple)
+    hook_callbacks: tuple[object, ...] = field(default_factory=tuple)
+    has_natives: bool = False
     listed_models_filters: tuple[CustomLogger, ...] = field(default_factory=tuple)
 
 
@@ -1945,6 +1959,172 @@ def _raise_malformed_listing_filter_return(error: MalformedListingFilterReturn) 
 
 def _proxy_hook_factory(hook_name: str) -> Callable[..., CustomLogger]:
     return get_proxy_hook(hook_name)
+
+
+def _request_dict(value: object) -> dict[str, object] | None:  # mutable-ok: the live proxy request dict
+    return cast("dict[str, object] | None", value)  # cast-ok: legacy hooks carry the untyped request dict
+
+
+def _parallel_input(
+    callback: CustomGuardrail,
+    data: dict[str, object],  # mutable-ok: the live proxy request dict
+    raw_request_snapshot: dict[str, object] | None,  # mutable-ok: same request-payload shape as data
+) -> dict[str, object]:  # mutable-ok: same request-payload shape as data
+    if not callback.scan_raw_request or raw_request_snapshot is None:
+        return data
+    return independent_snapshot(raw_request_snapshot)
+
+
+@dataclass(slots=True, eq=False)
+class _PreCallRun:
+    proxy: "ProxyLogging"
+    user_api_key_dict: UserAPIKeyAuth
+    call_type: CallTypesLiteral
+    guardrails_only: bool
+    skip_guardrails: bool
+    endpoint_type: EndpointType
+    raw_request_snapshot: dict[str, object] | None  # mutable-ok: same request-payload shape as latest
+    latest: dict[str, object] | None  # mutable-ok: the request as the callbacks have left it so far
+    pipeline_managed: frozenset[str] = frozenset()
+    deferred: SensitiveDataRouteException | None = None
+    parallel: list[tuple[CustomGuardrail, list[object]]] = field(  # mutable-ok: parallel results in list order
+        default_factory=list
+    )
+
+    def start(self, callback: object, request: object) -> Awaitable[Patch | None] | None:
+        data: Final = _request_dict(request)
+        if isinstance(callback, CustomGuardrail) and adapter_for(callback).parallel:
+            return self._start_parallel(callback, data)
+        return self._run_sequential(callback, data)
+
+    async def _run_sequential(
+        self,
+        callback: object,
+        data: dict[str, object] | None,  # mutable-ok: the live proxy request dict
+    ) -> Patch | None:
+        start_time: Final = time.time()
+        updated: dict[str, object] | None = data  # rebind-ok: a hook may replace the request  # mutable-ok: request
+        try:
+            if isinstance(callback, CustomGuardrail) and data is not None:
+                if self.skip_guardrails:
+                    return None
+                if callback.guardrail_name and callback.guardrail_name in self.pipeline_managed:
+                    return None
+                updated = await self.proxy._run_sequential_guardrail_callback(  # rebind-ok: see above
+                    callback=callback,
+                    data=data,
+                    raw_request_snapshot=self.raw_request_snapshot,
+                    user_api_key_dict=self.user_api_key_dict,
+                    call_type=self.call_type,
+                )
+            elif (
+                isinstance(callback, CustomLogger)
+                and (not self.guardrails_only or callback.enforces_request_content)
+                and _overrides_hook(callback, "async_pre_call_hook")
+            ):
+                if self.call_type in MCP_GUARDRAIL_CALL_TYPES and self.user_api_key_dict is None:
+                    return None
+                response: Final[Exception | str | Mapping[str, object] | None] = (
+                    await callback.async_pre_call_hook(
+                        user_api_key_dict=self.user_api_key_dict,
+                        cache=self.proxy.call_details["user_api_key_cache"],
+                        data=data,
+                        call_type=self.call_type,
+                        endpoint_type=self.endpoint_type,
+                    )
+                    if isinstance(callback, PROXY_MaxParallelRequestsHandler_v3)
+                    else await callback.async_pre_call_hook(
+                        user_api_key_dict=self.user_api_key_dict,
+                        cache=self.proxy.call_details["user_api_key_cache"],
+                        data=data,
+                        call_type=self.call_type,
+                    )
+                )
+                if response is not None:
+                    updated = await self.proxy.process_pre_call_hook_response(  # rebind-ok: see above
+                        response=response, data=data, call_type=self.call_type
+                    )
+        except SensitiveDataRouteException as e:
+            if self.deferred is None:
+                self.deferred = e
+
+        end_time: Final = time.time()
+        duration: Final = end_time - start_time
+        if hasattr(self.proxy, "service_logging_obj") and duration > 0.01:
+            await self.proxy.service_logging_obj.async_service_success_hook(
+                service=ServiceTypes.PROXY_PRE_CALL,
+                duration=duration,
+                call_type=f"{callback.__class__.__name__}",
+                parent_otel_span=getattr(self.user_api_key_dict, "parent_otel_span", None),
+                start_time=start_time,
+                end_time=end_time,
+            )
+        self.latest = updated
+        return kwargs_patch(data, updated)
+
+    async def apply_deferred_reroute(self, fields: Mapping[Field, object]) -> Mapping[Field, object]:
+        data: Final = _request_dict(fields[Field.deprecated_kwargs])
+        if self.deferred is None or data is None:
+            return fields
+        rerouted: Final = await self.proxy._handle_sensitive_data_route_exception(
+            self.deferred, data, self.user_api_key_dict
+        )
+        self.latest = rerouted
+        return apply_patch(fields, Patch().set(Field.deprecated_kwargs, rerouted))
+
+    def _start_parallel(
+        self,
+        callback: CustomGuardrail,
+        data: dict[str, object] | None,  # mutable-ok: the live proxy request dict
+    ) -> Awaitable[None] | None:
+        if self.skip_guardrails or data is None:
+            return None
+        if callback.guardrail_name and callback.guardrail_name in self.pipeline_managed:
+            return None
+        slot: Final[list[object]] = []  # mutable-ok: filled with this guardrail's result or exception
+        self.parallel.append((callback, slot))
+        return self._run_parallel(callback, _parallel_input(callback, data, self.raw_request_snapshot), slot)
+
+    async def _run_parallel(
+        self,
+        callback: CustomGuardrail,
+        data: dict[str, object],  # mutable-ok: the live request or a raw-request snapshot
+        slot: list[object],  # mutable-ok: see _start_parallel
+    ) -> None:
+        try:
+            result: Final = await self.proxy._process_guardrail_callback(
+                callback=callback,
+                data=data,
+                user_api_key_dict=self.user_api_key_dict,
+                call_type=self.call_type,
+                event_type=GuardrailEventHooks.pre_call,
+            )
+        except BaseException as e:
+            slot.append(e)
+            if _exception_changes_request_flow(e):
+                return
+            raise
+        slot.append(result)
+
+    def settle_parallel(self) -> None:
+        data: Final = self.latest
+        if data is None:
+            return
+        for callback, slot in self.parallel:
+            if not slot:
+                continue
+            result = slot[0]
+            if callback.scan_raw_request and not isinstance(result, BaseException) and result is not None:
+                callback.mark_pre_call_hook_ran(data)
+            if isinstance(result, BaseException) and not isinstance(result, SensitiveDataRouteException):
+                _record_raising_guardrail(data, callback)
+
+    def raise_parallel_flow_change(self) -> None:
+        raised: Final = next(
+            (slot[0] for _, slot in self.parallel if slot and isinstance(slot[0], BaseException)), None
+        )
+        if raised is not None:
+            raise raised
 
 
 class ProxyLogging:
@@ -3294,241 +3474,65 @@ class ProxyLogging:
             independent_snapshot(data) if needs_raw_request_snapshot else None
         )
 
-        return await run_legacy_hook(
-            Hook.pre_call,
-            lambda _patches: self._legacy_pre_call(
-                request_data=data,
+        return await self._dispatch_pre_call(
+            _PreCallRun(
+                proxy=self,
                 user_api_key_dict=user_api_key_dict,
                 call_type=call_type,
                 guardrails_only=guardrails_only,
                 skip_guardrails=skip_guardrails,
                 endpoint_type=endpoint_type,
                 raw_request_snapshot=raw_request_snapshot,
-            ),
+                latest=data,
+            )
         )
 
-    async def _legacy_pre_call(
-        self,
-        request_data: dict[str, object],  # mutable-ok: same request-payload shape as pre_call_hook's data
-        user_api_key_dict: UserAPIKeyAuth,
-        call_type: CallTypesLiteral,
-        guardrails_only: bool,
-        skip_guardrails: bool,
-        endpoint_type: EndpointType,
-        raw_request_snapshot: dict[str, object] | None,  # mutable-ok: same request-payload shape as data
-    ) -> dict[str, object] | None:  # mutable-ok: same request-payload shape as data
-        data: dict[str, object] | None = request_data  # rebind-ok: hooks replace it  # mutable-ok: request dict
+    async def _dispatch_pre_call(self, run: "_PreCallRun") -> dict[str, object] | None:  # mutable-ok: request dict
         try:
-            if not skip_guardrails:
-                data, _ = await self._maybe_execute_pipelines(  # rebind-ok: pipeline edits feed the callback loop below
-                    data=data,
-                    user_api_key_dict=user_api_key_dict,
-                    call_type=call_type,
+            if not run.skip_guardrails and run.latest is not None:
+                run.latest, _ = await self._maybe_execute_pipelines(
+                    data=run.latest,
+                    user_api_key_dict=run.user_api_key_dict,
+                    call_type=run.call_type,
                     event_hook="pre_call",
-                    raw_request_snapshot=raw_request_snapshot,
+                    raw_request_snapshot=run.raw_request_snapshot,
                 )
-
-            # Get pipeline-managed guardrails to skip in normal loop
-            pipeline_managed: Final[frozenset[str]] = (
-                frozenset() if skip_guardrails else pipeline_managed_guardrail_names(data, "pre_call")
-            )
+            if not run.skip_guardrails and run.latest is not None:
+                run.pipeline_managed = pipeline_managed_guardrail_names(run.latest, "pre_call")
 
             caps: Final = ProxyLogging.callback_capabilities()
-            # Skip the per-request callback walk entirely when nothing in
-            # ``litellm.callbacks`` overrides ``async_pre_call_hook`` and no
-            # CustomGuardrail is configured. Saves the loop overhead +
-            # ``time.time()`` x2 per registered callback for the common
-            # "callbacks=[]" case on small / dev deployments.
             if (
-                (skip_guardrails or not caps.has_guardrail)
+                (run.skip_guardrails or not caps.has_guardrail)
                 and not caps.has_content_enforcer
-                and (guardrails_only or not caps.has_pre_call_override)
+                and (run.guardrails_only or not caps.has_pre_call_override)
+                and not caps.has_natives
             ):
-                if data is not None:
-                    self._process_guardrail_metadata(data, skip_guardrails=skip_guardrails)
-                return data
+                if run.latest is not None:
+                    self._process_guardrail_metadata(run.latest, skip_guardrails=run.skip_guardrails)
+                return run.latest
 
-            parallel_guardrails: Final[tuple[CustomGuardrail, ...]] = (
-                ()
-                if skip_guardrails
-                else tuple(
-                    cb
-                    for cb in caps.resolved_callbacks
-                    if isinstance(cb, CustomGuardrail)
-                    and getattr(cb, "run_in_parallel", False)
-                    and not (cb.guardrail_name and cb.guardrail_name in pipeline_managed)
+            line: Final = hook_line(Hook.pre_call, caps.hook_callbacks, natives=not run.guardrails_only)
+            try:
+                result: Final = await run_line(
+                    line, KwargsFields(run.latest, PROXY_REQUEST_KEYS), run.start, between=run.apply_deferred_reroute
                 )
-            )
+            finally:
+                run.settle_parallel()
+            run.latest = _request_dict(kwargs_after(result))
+            run.raise_parallel_flow_change()
 
-            deferred_route_exc: SensitiveDataRouteException | None = None
-            for _callback in caps.resolved_callbacks:
-                start_time = time.time()
-                try:
-                    if isinstance(_callback, CustomGuardrail) and data is not None:
-                        if skip_guardrails:
-                            continue
-
-                        # Skip guardrails managed by a pipeline
-                        if _callback.guardrail_name and _callback.guardrail_name in pipeline_managed:
-                            continue
-
-                        if getattr(_callback, "run_in_parallel", False):
-                            continue
-
-                        data = await self._run_sequential_guardrail_callback(
-                            callback=_callback,
-                            data=data,
-                            raw_request_snapshot=raw_request_snapshot,
-                            user_api_key_dict=user_api_key_dict,
-                            call_type=call_type,
-                        )
-
-                    elif (
-                        _callback is not None
-                        and isinstance(_callback, CustomLogger)
-                        and (not guardrails_only or _callback.enforces_request_content)
-                        and _overrides_hook(_callback, "async_pre_call_hook")
-                    ):
-                        if call_type in MCP_GUARDRAIL_CALL_TYPES and user_api_key_dict is None:
-                            continue
-
-                        response: Exception | str | Mapping[str, object] | None = (
-                            await _callback.async_pre_call_hook(
-                                user_api_key_dict=user_api_key_dict,
-                                cache=self.call_details["user_api_key_cache"],
-                                data=data,
-                                call_type=call_type,
-                                endpoint_type=endpoint_type,
-                            )
-                            if isinstance(_callback, PROXY_MaxParallelRequestsHandler_v3)
-                            else await _callback.async_pre_call_hook(
-                                user_api_key_dict=user_api_key_dict,
-                                cache=self.call_details["user_api_key_cache"],
-                                data=data,
-                                call_type=call_type,
-                            )
-                        )
-                        if response is not None:
-                            data = await self.process_pre_call_hook_response(
-                                response=response, data=data, call_type=call_type
-                            )
-                except SensitiveDataRouteException as e:
-                    # Defer the reroute until remaining guardrails have run so later
-                    # security checks are not skipped; the first reroute wins and a
-                    # later guardrail that blocks still propagates. Fall through to the
-                    # service-span recording below so the triggering guardrail is still
-                    # timed like every other callback.
-                    if deferred_route_exc is None:
-                        deferred_route_exc = e
-
-                end_time = time.time()
-                duration = end_time - start_time
-                if (
-                    hasattr(self, "service_logging_obj") and duration > 0.01
-                ):  # only if duration is non-negligible - don't spam the logs
-                    await self.service_logging_obj.async_service_success_hook(
-                        service=ServiceTypes.PROXY_PRE_CALL,
-                        duration=duration,
-                        call_type=f"{_callback.__class__.__name__}",
-                        parent_otel_span=getattr(user_api_key_dict, "parent_otel_span", None),
-                        start_time=start_time,
-                        end_time=end_time,
-                    )
-
-            if deferred_route_exc is not None and data is not None:
-                data = await self._handle_sensitive_data_route_exception(  # rebind-ok: the reroute replaces the request
-                    deferred_route_exc, data, user_api_key_dict
-                )
-
-            if parallel_guardrails and data is not None:
-                await self._run_parallel_pre_call_guardrails(
-                    guardrails=parallel_guardrails,
-                    data=data,
-                    raw_request_snapshot=raw_request_snapshot,
-                    user_api_key_dict=user_api_key_dict,
-                    call_type=call_type,
-                )
-
-            if data is not None:
-                self._process_guardrail_metadata(data, skip_guardrails=skip_guardrails)
-
-            return data
+            if run.latest is not None:
+                self._process_guardrail_metadata(run.latest, skip_guardrails=run.skip_guardrails)
+            return run.latest
         except SensitiveDataRouteException as e:
-            data = await self._handle_sensitive_data_route_exception(  # rebind-ok: the reroute replaces the request
-                e, data, user_api_key_dict
-            )
-            if data is not None:
-                self._process_guardrail_metadata(data, skip_guardrails=skip_guardrails)
-            return data
+            rerouted: Final = await self._handle_sensitive_data_route_exception(e, run.latest, run.user_api_key_dict)
+            if rerouted is not None:
+                self._process_guardrail_metadata(rerouted, skip_guardrails=run.skip_guardrails)
+            return rerouted
         except Exception:
-            if data is not None:
-                self._process_guardrail_metadata(data, skip_guardrails=skip_guardrails)
+            if run.latest is not None:
+                self._process_guardrail_metadata(run.latest, skip_guardrails=run.skip_guardrails)
             raise
-
-    async def _run_parallel_pre_call_guardrails(
-        self,
-        guardrails: tuple[CustomGuardrail, ...],
-        data: dict,
-        raw_request_snapshot: dict | None,  # mutable-ok: same request-payload shape as data
-        user_api_key_dict: UserAPIKeyAuth,
-        call_type: CallTypesLiteral,
-    ) -> None:
-        """
-        Run opted-in pre_call guardrails concurrently against one shared payload
-        snapshot. These guardrails are declared block-only, so any modified data
-        they return is discarded; they run for their blocking side effect (raising
-        to reject the request before it reaches the LLM). Every guardrail is
-        awaited to completion (``return_exceptions=True``) so a raise by one never
-        leaves the others running as unobserved background tasks. A guardrail that
-        blocks (any exception other than a reroute or passthrough) takes precedence
-        over one that only changes the request flow, so a fast reroute can never
-        let a slower block be bypassed; the request is rejected before it reaches
-        the LLM, preserving the pre-call barrier that ``during_call`` guardrails
-        cannot provide. Per-guardrail latency is recorded by
-        ``_process_guardrail_callback``'s own metrics.
-
-        A guardrail that also opted into ``scan_raw_request`` evaluates
-        ``raw_request_snapshot`` (taken before the sequential loop ran) instead
-        of ``data`` (the sequential loop's output), for the same reason the
-        sequential branch does: its block decision must not depend on what a
-        sequential guardrail already masked or rewrote.
-        """
-
-        def _input_for(callback: CustomGuardrail) -> dict:  # mutable-ok: same request-payload shape as data
-            if not callback.scan_raw_request or raw_request_snapshot is None:
-                return data
-            return independent_snapshot(raw_request_snapshot)
-
-        results: Final = await asyncio.gather(
-            *(
-                self._process_guardrail_callback(
-                    callback=callback,
-                    data=_input_for(callback),
-                    user_api_key_dict=user_api_key_dict,
-                    call_type=call_type,
-                    event_type=GuardrailEventHooks.pre_call,
-                )
-                for callback in guardrails
-            ),
-            return_exceptions=True,
-        )
-        for callback, result in zip(guardrails, results, strict=True):
-            # _process_guardrail_callback stamped mark_pre_call_hook_ran on
-            # _input_for's throwaway snapshot copy for a scan_raw_request
-            # guardrail, never on the live, shared `data` -- without this, a
-            # deployment-level guardrail sharing this name would see no marker
-            # via _pre_call_hook_already_ran and re-run it a second time on
-            # live kwargs.
-            if callback.scan_raw_request and not isinstance(result, BaseException) and result is not None:
-                callback.mark_pre_call_hook_ran(data)
-            if isinstance(result, BaseException) and not isinstance(result, SensitiveDataRouteException):
-                _record_raising_guardrail(data, callback)
-        raised: Final = tuple(result for result in results if isinstance(result, BaseException))
-        blocking: Final = next((exc for exc in raised if not _exception_changes_request_flow(exc)), None)
-        if blocking is not None:
-            raise blocking
-        if raised:
-            raise raised[0]
 
     async def _handle_sensitive_data_route_exception(
         self,
@@ -3700,8 +3704,12 @@ class ProxyLogging:
         has_moderation_override = False
         iterator_overrides: Final[list[tuple[CustomLogger, str]]] = []  # (callback, kind)
         resolved_callbacks: Final[list[CustomLogger]] = []
+        hook_callbacks: Final[list[object]] = []  # mutable-ok: built once per callback-list signature
 
         for callback in callbacks:
+            if isinstance(callback, CustomLoggerV2):
+                hook_callbacks.append(callback)
+                continue
             if isinstance(callback, str):
                 resolved = litellm.litellm_core_utils.litellm_logging.get_custom_logger_compatible_class(
                     cast(_custom_logger_compatible_callbacks_literal, callback)
@@ -3711,6 +3719,7 @@ class ProxyLogging:
             if resolved is None or not isinstance(resolved, CustomLogger):
                 continue
             resolved_callbacks.append(resolved)
+            hook_callbacks.append(resolved)
             cls = type(resolved)
             if cls is CustomLogger:
                 continue
@@ -3743,6 +3752,8 @@ class ProxyLogging:
             has_moderation_override=has_moderation_override,
             iterator_overrides=tuple(iterator_overrides),
             resolved_callbacks=tuple(resolved_callbacks),
+            hook_callbacks=tuple(hook_callbacks),
+            has_natives=len(hook_callbacks) > len(resolved_callbacks),
             listed_models_filters=tuple(
                 callback for callback in resolved_callbacks if _overrides_hook(callback, "async_filter_listed_models")
             ),
@@ -3808,87 +3819,63 @@ class ProxyLogging:
         call_type: CallTypesLiteral,
         guardrails_only: bool = False,
     ):
-        return await run_legacy_hook(
-            Hook.during_call,
-            lambda _patches: self._legacy_during_call(
-                data=data,
-                user_api_key_dict=user_api_key_dict,
-                call_type=call_type,
-                guardrails_only=guardrails_only,
-            ),
-        )
+        caps: Final = ProxyLogging.callback_capabilities()
+        if not caps.has_guardrail and not caps.has_moderation_override and not caps.has_natives:
+            return data
+        line: Final = hook_line(Hook.during_call, litellm.callbacks, natives=not guardrails_only)
 
-    async def _legacy_during_call(
+        def start(callback: object, request: object) -> Awaitable[object] | None:
+            return self._start_during_call(callback, request, user_api_key_dict, call_type, guardrails_only)
+
+        _ = kwargs_after(await run_line(line, KwargsFields(data, PROXY_REQUEST_KEYS), start))
+        return data
+
+    def _start_during_call(
         self,
-        data: dict[str, object],  # mutable-ok: same request-payload shape as during_call_hook's data
+        callback: object,
+        request: object,
         user_api_key_dict: UserAPIKeyAuth | None,
         call_type: CallTypesLiteral,
         guardrails_only: bool,
-    ) -> dict[str, object]:  # mutable-ok: the request payload is handed back unchanged
-        caps: Final = ProxyLogging.callback_capabilities()
-        if not caps.has_guardrail and not caps.has_moderation_override:
-            return data
-        # Step 1: Collect all guardrail tasks to run in parallel
-        guardrail_tasks: Final = []
-
-        for callback in litellm.callbacks:
-            if (
-                isinstance(callback, CustomLogger)
-                and not isinstance(callback, CustomGuardrail)
-                and (not guardrails_only or callback.enforces_request_content)
-                and _overrides_moderation_hook(callback)
-                and user_api_key_dict is not None
-            ):
-                guardrail_tasks.append(
-                    callback.async_moderation_hook(
-                        data=data,
-                        user_api_key_dict=user_api_key_dict,
-                        call_type=call_type,
-                    )
-                )
-            elif isinstance(callback, CustomGuardrail):
-                ################################################################
-                # Check if guardrail should be run for GuardrailEventHooks.during_call hook
-                ################################################################
-
-                # V1 implementation - backwards compatibility
-                if callback.event_hook is None and hasattr(callback, "moderation_check"):
-                    if callback.moderation_check == "pre_call":
-                        continue
-                else:
-                    # Main - V2 Guardrails implementation
-                    from litellm.types.guardrails import GuardrailEventHooks
-
-                    event_type = GuardrailEventHooks.during_call
-                    if call_type == CallTypes.call_mcp_tool.value:
-                        event_type = GuardrailEventHooks.during_mcp_call
-
-                    if callback.should_run_guardrail(data=data, event_type=event_type) is not True:
-                        continue
-                # Convert user_api_key_dict to proper format for async_moderation_hook
-                if call_type == CallTypes.call_mcp_tool.value:
-                    user_api_key_auth_dict = self._convert_user_api_key_auth_to_dict(user_api_key_dict)
-                else:
-                    user_api_key_auth_dict = user_api_key_dict
-                guardrail_tasks.append(
-                    self._run_during_call_guardrail(
-                        callback=callback,
-                        data=data,
-                        user_api_key_dict=user_api_key_dict,
-                        user_api_key_auth_dict=user_api_key_auth_dict,
-                        call_type=call_type,
-                    )
-                )
-
-        # Step 2: Run all guardrail tasks in parallel
-        if guardrail_tasks:
-            try:
-                await asyncio.gather(*guardrail_tasks)
-            except Exception as e:
-                # If any guardrail raises an exception, it will propagate here
-                raise e
-
-        return data
+    ) -> Awaitable[object] | None:
+        data: Final = _request_dict(request)
+        if data is None:
+            return None
+        if (
+            isinstance(callback, CustomLogger)
+            and not isinstance(callback, CustomGuardrail)
+            and (not guardrails_only or callback.enforces_request_content)
+            and _overrides_moderation_hook(callback)
+            and user_api_key_dict is not None
+        ):
+            return callback.async_moderation_hook(data=data, user_api_key_dict=user_api_key_dict, call_type=call_type)
+        if not isinstance(callback, CustomGuardrail):
+            return None
+        if callback.event_hook is None and hasattr(callback, "moderation_check"):
+            if callback.moderation_check == "pre_call":
+                return None
+        elif (
+            callback.should_run_guardrail(
+                data=data,
+                event_type=GuardrailEventHooks.during_mcp_call
+                if call_type == CallTypes.call_mcp_tool.value
+                else GuardrailEventHooks.during_call,
+            )
+            is not True
+        ):
+            return None
+        user_api_key_auth_dict: Final = (
+            self._convert_user_api_key_auth_to_dict(user_api_key_dict)
+            if call_type == CallTypes.call_mcp_tool.value
+            else user_api_key_dict
+        )
+        return self._run_during_call_guardrail(
+            callback=callback,
+            data=data,
+            user_api_key_dict=user_api_key_dict,
+            user_api_key_auth_dict=user_api_key_auth_dict,
+            call_type=call_type,
+        )
 
     async def _run_during_call_guardrail(
         self,
