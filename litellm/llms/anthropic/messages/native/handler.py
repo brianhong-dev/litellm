@@ -19,8 +19,19 @@ from litellm._logging import verbose_logger
 from litellm.anthropic_beta_headers_manager import aload_beta_headers_config
 from litellm.constants import PROVIDERS_THAT_AUTHENTICATE_ON_PROVIDER_INFO
 from litellm.integrations.anthropic_cache_control_hook import AnthropicCacheControlHook
+from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.custom_logger_v2.enums import Hook
-from litellm.integrations.custom_logger_v2.host import has_natives
+from litellm.integrations.custom_logger_v2.legacy import (
+    PROXY_REQUEST_KEYS,
+    Admit,
+    KwargsFields,
+    hook_line,
+    kwargs_after,
+    kwargs_patch,
+    run_line,
+)
+from litellm.integrations.custom_logger_v2.logger import CustomLoggerV2
+from litellm.integrations.custom_logger_v2.outcomes import Patch
 from litellm.litellm_core_utils.core_helpers import as_str_mapping, drops_unsupported_params
 from litellm.litellm_core_utils.exception_mapping_utils import exception_type
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
@@ -51,7 +62,7 @@ from litellm.types.llms.anthropic_messages.anthropic_response import (
 )
 from litellm.types.router import GenericLiteLLMParams
 from litellm.types.utils import CallTypes, LlmProviders, LlmProvidersSet
-from litellm.utils import ProviderConfigManager, client, route_through_dispatcher
+from litellm.utils import ProviderConfigManager, client
 
 from ..adapters.handler import LiteLLMMessagesToCompletionTransformationHandler, request_safeguards_evaluator
 from ..responses_adapters.handler import LiteLLMMessagesToResponsesAPIHandler
@@ -388,10 +399,21 @@ async def _execute_pre_request_hooks(
     if not litellm.callbacks:
         return request_kwargs
 
-    from litellm.integrations.custom_logger import CustomLogger as _CustomLogger
+    callbacks: Final = litellm.callbacks
+    if (
+        Hook.pre_deployment_call in CustomLoggerV2.declared_hooks
+        and (line := hook_line(Hook.pre_deployment_call, callbacks, admit=Admit.every_logger)).has_natives
+    ):
+        return kwargs_after(  # pyright: ignore[reportReturnType]  # whatever the last hook returned, as before
+            await run_line(
+                line,
+                KwargsFields(request_kwargs, PROXY_REQUEST_KEYS),
+                partial(_start_pre_request_hook, model, messages),
+            )
+        )
 
-    for callback in litellm.callbacks:
-        if not isinstance(callback, _CustomLogger):
+    for callback in callbacks:
+        if not isinstance(callback, CustomLogger):
             continue
 
         # Call the pre-request hook
@@ -402,6 +424,21 @@ async def _execute_pre_request_hooks(
             request_kwargs = modified_kwargs
 
     return request_kwargs
+
+
+def _start_pre_request_hook(
+    model: str, messages: list[dict], callback: object, request_kwargs: object
+) -> Awaitable[Patch | None] | None:
+    if not isinstance(callback, CustomLogger):
+        return None
+    return _pre_request_hook(callback, model, messages, request_kwargs)
+
+
+async def _pre_request_hook(
+    callback: CustomLogger, model: str, messages: list[dict], request_kwargs: object
+) -> Patch | None:
+    modified_kwargs: Final = await callback.async_pre_request_hook(model, messages, request_kwargs)  # pyright: ignore[reportArgumentType]  # the request dict as the previous hook left it
+    return None if modified_kwargs is None else kwargs_patch(request_kwargs, modified_kwargs)
 
 
 async def _try_websearch_short_circuit(
@@ -505,14 +542,7 @@ async def anthropic_messages(
     # tool_choice is forwarded explicitly (it is a named param, not in kwargs)
     # so hooks that rename tools — e.g. websearch_interception converting
     # web_search -> litellm_web_search — can keep a forced tool_choice in sync.
-    request_kwargs: Final = await (
-        route_through_dispatcher(
-            Hook.pre_deployment_call,
-            _execute_pre_request_hooks,  # pyright: ignore[reportUnknownArgumentType]  # the legacy hook is untyped
-        )
-        if has_natives(Hook.pre_deployment_call)
-        else _execute_pre_request_hooks
-    )(
+    request_kwargs: Final = await _execute_pre_request_hooks(
         model=model,
         messages=messages,
         tools=tools,

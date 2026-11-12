@@ -25,8 +25,7 @@ from litellm.integrations.code_interpreter_interception.handler import (
     LITELLM_CODE_EXECUTION_TOOL_NAME,
 )
 from litellm.integrations.custom_logger import CustomLogger
-from litellm.integrations.custom_logger_v2 import CallContext, CustomLoggerV2, Hook, build_manifest, on
-from litellm.integrations.custom_logger_v2.host import register_native, reset_host_for_tests
+from litellm.integrations.custom_logger_v2 import CallContext, CustomLoggerV2, Field, Hook, on
 from litellm.integrations.websearch_interception.handler import WebSearchInterceptionLogger
 from litellm.llms.azure.responses.transformation import AzureOpenAIResponsesAPIConfig
 from litellm.llms.azure.vector_stores.transformation import AzureOpenAIVectorStoreConfig
@@ -6866,16 +6865,9 @@ async def test_a_stream_answered_with_one_json_body_is_not_replayed_for_a_provid
             _ = tuple([event async for event in stream])
 
 
-@pytest.fixture
-def v2_host() -> Iterator[None]:
-    reset_host_for_tests()
-    yield
-    reset_host_for_tests()
-
-
 @pytest.mark.parametrize("native", [False, True])
 def test_sync_responses_send_the_params_the_pre_deployment_hook_returned(
-    monkeypatch: pytest.MonkeyPatch, v2_host: None, native: bool
+    monkeypatch: pytest.MonkeyPatch, native: bool
 ) -> None:
     seen: Final[list[str]] = []
 
@@ -6891,9 +6883,7 @@ def test_sync_responses_send_the_params_the_pre_deployment_hook_returned(
         async def gate(self, view: object, ctx: CallContext[object]) -> None:
             seen.append("native")
 
-    monkeypatch.setattr(litellm, "callbacks", [TemperatureRewriter()])
-    if native:
-        register_native(build_manifest(Gate()))
+    monkeypatch.setattr(litellm, "callbacks", [*([Gate()] if native else []), TemperatureRewriter()])
     logging_obj: Final = Mock()
     logging_obj.dynamic_success_callbacks = []
 
@@ -6908,3 +6898,32 @@ def test_sync_responses_send_the_params_the_pre_deployment_hook_returned(
 
     assert response_params["temperature"] == 0.25
     assert seen == (["native", "legacy"] if native else ["legacy"])
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_sync_responses_run_a_native_pre_deployment_hook_without_any_legacy_override(
+    monkeypatch: pytest.MonkeyPatch, native: bool
+) -> None:
+    seen: Final[list[object]] = []
+
+    class Gate(CustomLoggerV2):
+        @on(Hook.pre_deployment_call, reads={Field.model}, may_abort=True)
+        async def gate(self, view: object, ctx: CallContext[object]) -> None:
+            seen.append(getattr(view, "model"))  # noqa: B009  # the view's declared field
+
+    monkeypatch.setattr(litellm, "callbacks", [CustomLogger(), *([Gate()] if native else [])])
+    logging_obj: Final = Mock()
+    logging_obj.dynamic_success_callbacks = []
+    params: Final[dict[str, object]] = {"temperature": 1.0}
+
+    _, _, _, response_params, _ = BaseLLMHTTPHandler()._run_sync_responses_pre_call_deployment_hook(
+        model="gpt-5.5",
+        input="hi",
+        custom_llm_provider="openai",
+        response_api_optional_request_params=params,
+        litellm_params=GenericLiteLLMParams(),
+        logging_obj=logging_obj,
+    )
+
+    assert seen == (["gpt-5.5"] if native else [])
+    assert response_params["temperature"] == 1.0

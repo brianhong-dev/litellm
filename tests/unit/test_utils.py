@@ -13,7 +13,7 @@ import queue
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from functools import partial
@@ -44,8 +44,8 @@ from litellm.caching.in_memory_cache import InMemoryCache
 from litellm.constants import DEFAULT_MOCK_RESPONSE_COMPLETION_TOKEN_COUNT
 from litellm.integrations.custom_guardrail import CustomGuardrail
 from litellm.integrations.custom_logger import CustomLogger
-from litellm.integrations.custom_logger_v2 import CallContext, CustomLoggerV2, Hook, build_manifest, on
-from litellm.integrations.custom_logger_v2.host import register_native, reset_host_for_tests
+from litellm.integrations.custom_logger_v2 import Abort, CallContext, CustomLoggerV2, Field, Hook, Patch, on
+from litellm.integrations.custom_logger_v2.host import NativeOutcome
 from litellm.integrations.humanloop import HumanloopLogger
 from litellm.llms.base_llm.audio_transcription.transformation import BaseAudioTranscriptionConfig
 from litellm.integrations.langfuse.langfuse_prompt_management import LangfusePromptManagement
@@ -11852,6 +11852,284 @@ async def test_pre_call_deployment_hook_hands_responses_compact_its_call_type(mo
 _REWRITTEN_RESPONSE: Final = ModelResponse(id="rewritten-by-the-deployment-hook")
 
 
+class _DeploymentLogger(CustomLogger):
+    def __init__(
+        self,
+        name: str,
+        journal: list[object],
+        replacement: object = None,
+        error: Exception | None = None,
+    ) -> None:
+        super().__init__()
+        self.name = name
+        self.journal = journal
+        self.replacement = replacement
+        self.error = error
+        self.seen: list[tuple[object, ...]] = []
+
+    def _record(self, *seen: object) -> object:
+        self.journal.append(self.name)
+        self.seen.append(seen)
+        if self.error is not None:
+            raise self.error
+        return self.replacement
+
+    async def async_pre_call_deployment_hook(
+        self, kwargs: dict[str, object], call_type: CallTypes | None
+    ) -> dict[str, object] | None:
+        return cast("dict[str, object] | None", self._record(kwargs, call_type))
+
+    async def async_post_call_success_deployment_hook(
+        self, request_data: dict[str, object], response: object, call_type: CallTypes | None
+    ) -> object:
+        return self._record(request_data, response, call_type)
+
+    async def async_post_call_failure_deployment_hook(
+        self,
+        request_data: Mapping[str, object],
+        exception: Exception,
+        call_type: CallTypes | None,
+        fallback_depth: int | None = None,
+    ) -> None:
+        self._record(request_data, exception, call_type, fallback_depth)
+
+
+class _DeploymentGuardrail(CustomGuardrail):
+    def __init__(self, error: Exception) -> None:
+        super().__init__(guardrail_name="deployment-guard", default_on=True)
+        self.error = error
+
+    async def async_post_call_success_deployment_hook(
+        self, request_data: dict[str, object], response: object, call_type: CallTypes | None
+    ) -> object:
+        raise self.error
+
+
+class _DeploymentNative(CustomLoggerV2):
+    def __init__(self, journal: list[object], replacement: object = None, outcome: Abort | None = None) -> None:
+        self.journal = journal
+        self.replacement = replacement
+        self.outcome = outcome
+
+    @on(Hook.pre_deployment_call, reads={Field.model}, may_abort=True)
+    async def pre_deployment(self, view: object, ctx: CallContext[object]) -> Abort | None:
+        self.journal.append(("native", getattr(view, "model")))  # noqa: B009  # the view's declared field
+        return self.outcome
+
+    @on(Hook.post_deployment_success, reads={Field.response}, writes={Field.response}, may_abort=True)
+    async def post_success(self, view: object, ctx: CallContext[object]) -> Patch | Abort | None:
+        self.journal.append(("native", getattr(view, "response")))  # noqa: B009  # see above
+        if self.outcome is not None:
+            return self.outcome
+        return None if self.replacement is None else Patch().set(Field.response, self.replacement)
+
+    @on(Hook.post_deployment_failure, reads={Field.error}, may_abort=True)
+    async def post_failure(self, view: object, ctx: CallContext[object]) -> Abort | None:
+        self.journal.append(("native", str(getattr(view, "error"))))  # noqa: B009  # see above
+        return self.outcome
+
+
+def _with_inert_native(callbacks: list[object], inert: bool) -> list[object]:
+    return [*callbacks, _DeploymentNative([])] if inert else callbacks
+
+
+@pytest.mark.parametrize("inert", [False, True])
+async def test_pre_deployment_hooks_run_in_order_and_a_returned_dict_replaces_the_kwargs(
+    monkeypatch: pytest.MonkeyPatch, inert: bool
+) -> None:
+    journal: Final[list[object]] = []
+    replaced: Final[dict[str, object]] = {"model": "replaced"}
+    first: Final = _DeploymentLogger("first", journal, replacement=replaced)
+    keeper: Final = _DeploymentLogger("keeper", journal)
+    last: Final = _DeploymentLogger("last", journal)
+    monkeypatch.setattr(litellm, "callbacks", _with_inert_native([first, "a-string-callback", keeper, last], inert))
+
+    result: Final = await async_pre_call_deployment_hook({"model": "original"}, "acompletion", natives=True)
+
+    assert journal == ["first", "keeper", "last"]
+    assert first.seen[0][0] == {"model": "original"}
+    assert keeper.seen[0][0] is replaced
+    assert last.seen[0][0] is replaced
+    assert result is replaced
+    assert first.seen[0][1] is CallTypes.acompletion
+
+
+@pytest.mark.parametrize("inert", [False, True])
+async def test_a_pre_deployment_hook_error_propagates_unchanged_and_stops_the_line(
+    monkeypatch: pytest.MonkeyPatch, inert: bool
+) -> None:
+    journal: Final[list[object]] = []
+    error: Final = ValueError("rejected before the deployment")
+    monkeypatch.setattr(
+        litellm,
+        "callbacks",
+        _with_inert_native(
+            [_DeploymentLogger("first", journal, error=error), _DeploymentLogger("next", journal)], inert
+        ),
+    )
+
+    with pytest.raises(ValueError, match="rejected before the deployment") as raised:
+        await async_pre_call_deployment_hook({"model": "m"}, "acompletion", natives=True)
+
+    assert raised.value is error
+    assert journal == ["first"]
+
+
+async def test_a_pre_deployment_native_between_legacy_hooks_sees_the_first_rewrite_and_its_abort_stops_the_rest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal: Final[list[object]] = []
+    abort: Final = Abort(status=403, message="deployment not allowed")
+    monkeypatch.setattr(
+        litellm,
+        "callbacks",
+        [
+            _DeploymentLogger("first", journal, replacement={"model": "rewritten"}),
+            _DeploymentNative(journal, outcome=abort),
+            _DeploymentLogger("after", journal),
+        ],
+    )
+
+    with pytest.raises(NativeOutcome) as raised:
+        await async_pre_call_deployment_hook({"model": "m"}, "acompletion", natives=True)
+
+    assert raised.value.outcome is abort
+    assert journal == ["first", ("native", "rewritten")]
+
+
+@pytest.mark.parametrize(
+    "hook_call",
+    [
+        pytest.param(lambda: async_pre_call_deployment_hook({"model": "m"}, "acompletion"), id="pre"),
+        pytest.param(
+            lambda: async_post_call_success_deployment_hook({"model": "m"}, ModelResponse(), CallTypes.acompletion),
+            id="success",
+        ),
+        pytest.param(
+            lambda: async_post_call_failure_deployment_hook({"model": "m"}, ValueError("x"), "acompletion"),
+            id="failure",
+        ),
+    ],
+)
+async def test_callers_that_do_not_ask_for_natives_run_only_the_legacy_hooks(
+    monkeypatch: pytest.MonkeyPatch, hook_call: Callable[[], object]
+) -> None:
+    journal: Final[list[object]] = []
+    monkeypatch.setattr(litellm, "callbacks", [_DeploymentNative(journal), _DeploymentLogger("legacy", journal)])
+
+    await cast("Awaitable[object]", hook_call())
+
+    assert journal == ["legacy"]
+
+
+@pytest.mark.parametrize("inert", [False, True])
+async def test_post_deployment_success_chains_replacements_and_swallows_a_logger_error(
+    monkeypatch: pytest.MonkeyPatch, inert: bool
+) -> None:
+    journal: Final[list[object]] = []
+    replacement: Final = ModelResponse(id="replaced")
+    first: Final = _DeploymentLogger("first", journal, replacement=replacement)
+    broken: Final = _DeploymentLogger("broken", journal, error=RuntimeError("logger bug"))
+    last: Final = _DeploymentLogger("last", journal)
+    monkeypatch.setattr(litellm, "callbacks", _with_inert_native([first, broken, last], inert))
+    request: Final[dict[str, object]] = {"model": "m"}
+    response: Final = ModelResponse(id="original")
+
+    result: Final = await async_post_call_success_deployment_hook(
+        request, response, CallTypes.acompletion, natives=True
+    )
+
+    assert journal == ["first", "broken", "last"]
+    assert first.seen[0][0] is request
+    assert first.seen[0][1] is response
+    assert broken.seen[0][1] is replacement
+    assert last.seen[0][1] is replacement
+    assert result is replacement
+
+
+@pytest.mark.parametrize("inert", [False, True])
+async def test_post_deployment_success_reraises_a_guardrail_error_and_stops_the_line(
+    monkeypatch: pytest.MonkeyPatch, inert: bool
+) -> None:
+    journal: Final[list[object]] = []
+    error: Final = ValueError("response blocked")
+    monkeypatch.setattr(
+        litellm,
+        "callbacks",
+        _with_inert_native([_DeploymentGuardrail(error), _DeploymentLogger("next", journal)], inert),
+    )
+
+    with pytest.raises(ValueError, match="response blocked") as raised:
+        await async_post_call_success_deployment_hook({}, ModelResponse(), CallTypes.acompletion, natives=True)
+
+    assert raised.value is error
+    assert journal == []
+
+
+async def test_a_post_deployment_success_native_between_legacy_hooks_sees_and_replaces_the_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal: Final[list[object]] = []
+    first_reply: Final = ModelResponse(id="first")
+    native_reply: Final = ModelResponse(id="native")
+    second: Final = _DeploymentLogger("second", journal)
+    monkeypatch.setattr(
+        litellm,
+        "callbacks",
+        [
+            _DeploymentLogger("first", journal, replacement=first_reply),
+            _DeploymentNative(journal, replacement=native_reply),
+            second,
+        ],
+    )
+
+    result: Final = await async_post_call_success_deployment_hook(
+        {}, ModelResponse(id="original"), CallTypes.acompletion, natives=True
+    )
+
+    assert journal == ["first", ("native", first_reply), "second"]
+    assert second.seen[0][1] is native_reply
+    assert result is native_reply
+
+
+@pytest.mark.parametrize("inert", [False, True])
+async def test_post_deployment_failure_hands_every_logger_a_snapshot_and_swallows_their_errors(
+    monkeypatch: pytest.MonkeyPatch, inert: bool
+) -> None:
+    journal: Final[list[object]] = []
+    broken: Final = _DeploymentLogger("broken", journal, error=RuntimeError("logger bug"))
+    last: Final = _DeploymentLogger("last", journal)
+    monkeypatch.setattr(litellm, "callbacks", _with_inert_native([broken, last], inert))
+    error: Final = ValueError("deployment failed")
+
+    await async_post_call_failure_deployment_hook(
+        {"model": "m", "fallback_depth": 2, "attempted_targets": object()}, error, "acompletion", natives=True
+    )
+
+    assert journal == ["broken", "last"]
+    request, seen_error, call_type, depth = last.seen[0]
+    assert dict(cast("Mapping[str, object]", request)) == {"model": "m", "fallback_depth": 2}
+    assert type(seen_error) is ValueError
+    assert seen_error is not error
+    assert broken.seen[0][1] is seen_error
+    assert (call_type, depth) == (CallTypes.acompletion, 2)
+
+
+async def test_a_post_deployment_failure_native_between_legacy_hooks_runs_in_list_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal: Final[list[object]] = []
+    monkeypatch.setattr(
+        litellm,
+        "callbacks",
+        [_DeploymentLogger("first", journal), _DeploymentNative(journal), _DeploymentLogger("second", journal)],
+    )
+
+    await async_post_call_failure_deployment_hook({}, ValueError("deployment failed"), "acompletion", natives=True)
+
+    assert journal == ["first", ("native", "deployment failed"), "second"]
+
+
 class _PreDeploymentRewriter(CustomLogger):
     def __init__(self, seen: list[str]) -> None:
         super().__init__()
@@ -11898,24 +12176,16 @@ def _deployment_gate(hook: Hook, seen: list[str]) -> CustomLoggerV2:
     return Gate()
 
 
-@pytest.fixture
-def v2_host() -> Iterator[None]:
-    reset_host_for_tests()
-    yield
-    reset_host_for_tests()
-
-
 def _install_deployment_hook(
     monkeypatch: pytest.MonkeyPatch, legacy: CustomLogger, native: Hook | None, seen: list[str]
 ) -> None:
-    monkeypatch.setattr(litellm, "callbacks", [legacy])
-    if native is not None:
-        register_native(build_manifest(_deployment_gate(native, seen)))
+    gate: Final = [] if native is None else [_deployment_gate(native, seen)]
+    monkeypatch.setattr(litellm, "callbacks", [*gate, legacy])
 
 
 @pytest.mark.parametrize("native", [False, True])
 async def test_pre_deployment_call_sends_the_kwargs_the_legacy_hook_returned(
-    monkeypatch: pytest.MonkeyPatch, v2_host: None, native: bool
+    monkeypatch: pytest.MonkeyPatch, native: bool
 ) -> None:
     seen: Final[list[str]] = []
     _install_deployment_hook(
@@ -11933,7 +12203,7 @@ async def test_pre_deployment_call_sends_the_kwargs_the_legacy_hook_returned(
 
 @pytest.mark.parametrize("native", [False, True])
 async def test_post_deployment_success_returns_what_the_legacy_hook_returned(
-    monkeypatch: pytest.MonkeyPatch, v2_host: None, native: bool
+    monkeypatch: pytest.MonkeyPatch, native: bool
 ) -> None:
     seen: Final[list[str]] = []
     _install_deployment_hook(
@@ -11950,7 +12220,7 @@ async def test_post_deployment_success_returns_what_the_legacy_hook_returned(
 
 @pytest.mark.parametrize("native", [False, True])
 async def test_post_deployment_failure_reaches_the_legacy_hook_and_keeps_the_real_error(
-    monkeypatch: pytest.MonkeyPatch, v2_host: None, native: bool
+    monkeypatch: pytest.MonkeyPatch, native: bool
 ) -> None:
     seen: Final[list[str]] = []
     recorder: Final = _PostDeploymentFailureRecorder(seen)
