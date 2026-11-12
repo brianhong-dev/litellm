@@ -159,7 +159,7 @@ export const useUserMcpOAuthFlow = ({
   }, [accessToken, serverId, serverAlias, scopes, preClientId]);
 
   const resumeOAuthFlow = useCallback(async () => {
-    if (typeof window === "undefined" || processingRef.current) return;
+    if (typeof window === "undefined" || processingRef.current || !accessToken) return;
 
     const storedResult = getStorage(RESULT_KEY);
     if (!storedResult) return;

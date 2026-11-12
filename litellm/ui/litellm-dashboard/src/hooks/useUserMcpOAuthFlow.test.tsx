@@ -68,6 +68,27 @@ describe("user OAuth granted scopes", () => {
     );
     expect(onSuccess).toHaveBeenCalledOnce();
   });
+
+  it("keeps the returned login until there is a token to save it with", async () => {
+    vi.mocked(networking.exchangeMcpOAuthToken).mockResolvedValue({
+      access_token: "vendor-token",
+      refresh_token: "vendor-refresh",
+    });
+    const onSuccess = vi.fn();
+    const { result, rerender } = renderHook(
+      ({ accessToken }) => useUserMcpOAuthFlow({ accessToken, serverId: "server-1", onSuccess }),
+      { initialProps: { accessToken: "" } },
+    );
+
+    expect(networking.exchangeMcpOAuthToken).not.toHaveBeenCalled();
+    expect(pendingUserMcpOAuthServerId()).toBe("server-1");
+
+    rerender({ accessToken: "caller" });
+
+    await waitFor(() => expect(result.current.status).toBe("success"));
+    expect(networking.storeMCPOAuthUserCredential).toHaveBeenCalledWith("caller", "server-1", expect.anything());
+    expect(onSuccess).toHaveBeenCalledOnce();
+  });
 });
 
 describe("pending user OAuth return", () => {
