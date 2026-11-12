@@ -4288,10 +4288,15 @@ class ProxyLogging:
         redacted_traceback_str: Final = redact_string(traceback_str) if traceback_str is not None else None
 
         callbacks: Final = litellm.callbacks
-        line: Final = hook_line(Hook.post_call_failure, callbacks, admit=Admit.every_entry)
-        run: Final = HookRun[Exception](response=original_exception)
+        run: Final[HookRun[Exception]] = HookRun(response=original_exception)
+        if not ProxyLogging.callback_capabilities().has_natives:
+            for callback in callbacks:
+                await self._post_call_failure_one(
+                    run, request_data, user_api_key_dict, redacted_traceback_str, callback, request_data
+                )
+            return run.transformed
         await run_hook_line(
-            line,
+            hook_line(Hook.post_call_failure, callbacks, admit=Admit.every_entry),
             hook_fields(request_data, run, Field.error),
             partial(self._post_call_failure_one, run, request_data, user_api_key_dict, redacted_traceback_str),
         )
@@ -4563,7 +4568,7 @@ class ProxyLogging:
 
         from litellm.proxy.proxy_server import llm_router
 
-        run: Final = HookRun[LLMResponseTypes](response=response)
+        run: Final[HookRun[LLMResponseTypes]] = HookRun(response=response)
         pipeline_response: Final = await self._run_post_call_pipelines(
             data=data,
             user_api_key_dict=user_api_key_dict,
@@ -4581,6 +4586,9 @@ class ProxyLogging:
             pipeline_managed=pipeline_managed,
             user_api_key_dict=user_api_key_dict,
         )
+        if not any(isinstance(callback, CustomLoggerV2) for callback in other_callbacks):
+            await self._post_call_without_natives(run, guardrails, guardrail_callbacks, other_callbacks)
+            return run.response
         fields: Final = hook_fields(data, run, Field.response)
         await run_hook_line(
             hook_line(Hook.post_call_success, guardrail_callbacks),
@@ -4595,16 +4603,51 @@ class ProxyLogging:
         )
         return run.response
 
+    async def _post_call_without_natives(
+        self,
+        run: HookRun[LLMResponseTypes],
+        guardrails: "_PostCallGuardrails",
+        guardrail_callbacks: tuple[CustomGuardrail, ...],
+        other_callbacks: tuple[CustomLogger, ...],
+    ) -> None:
+        flagged: Final = tuple((callback, adapter_for(callback).parallel) for callback in guardrail_callbacks)
+        for callback, is_parallel in flagged:
+            if not is_parallel:
+                await self._post_call_guardrail_begin(run, guardrails, callback, parallel=False)
+        parallel: Final = tuple(callback for callback, is_parallel in flagged if is_parallel)
+        if parallel:
+            started: Final = tuple(
+                self._post_call_guardrail_begin(run, guardrails, callback, parallel=True) for callback in parallel
+            )
+            results: Final = await asyncio.gather(*started, return_exceptions=True)
+            raised: Final = next((result for result in results if isinstance(result, BaseException)), None)
+            if raised is not None:
+                raise raised
+        run.raise_flow_change()
+        for callback in other_callbacks:
+            if _overrides_hook(callback, "async_post_call_success_hook"):
+                await self._post_call_logger(run, guardrails.data, guardrails.user_api_key_dict, callback, None)
+
     def _post_call_guardrail_start(
         self, run: HookRun[LLMResponseTypes], guardrails: "_PostCallGuardrails", callback: object, request: object
     ) -> Awaitable[None] | None:
         if not isinstance(callback, CustomGuardrail):
             return None
+        return self._post_call_guardrail_begin(run, guardrails, callback, parallel=adapter_for(callback).parallel)
+
+    async def _post_call_guardrail_begin(
+        self,
+        run: HookRun[LLMResponseTypes],
+        guardrails: "_PostCallGuardrails",
+        callback: CustomGuardrail,
+        parallel: bool,
+    ) -> None:
         if callback.guardrail_name and callback.guardrail_name in guardrails.pipeline_managed:
-            return None
-        if not adapter_for(callback).parallel:
-            return self._post_call_sequential_guardrail(run, guardrails, callback)
-        return self._post_call_parallel_guardrail(
+            return
+        if not parallel:
+            await self._post_call_sequential_guardrail(run, guardrails, callback)
+            return
+        await self._post_call_parallel_guardrail(
             run, guardrails, callback, guardrails.parallel_request_view(), run.parallel_slot()
         )
 
@@ -4715,7 +4758,7 @@ class ProxyLogging:
             verbose_proxy_logger.debug("MCP guardrail translation handler unavailable; skipping post_mcp_call hook")
             return response
 
-        run: Final = HookRun["CallToolResult"](response=response)
+        run: Final[HookRun[CallToolResult]] = HookRun(response=response)
         await run_hook_line(
             hook_line(Hook.mcp_tool_result, caps.hook_callbacks),
             hook_fields(request_data, run, Field.tool_result),
@@ -4831,7 +4874,7 @@ class ProxyLogging:
         if not caps.listed_models_filters and not caps.has_natives:
             return frozenset()
         candidates: Final = tuple(model_names)
-        run: Final = HookRun[tuple[str, ...]](response=candidates)
+        run: Final[HookRun[tuple[str, ...]]] = HookRun(response=candidates)
         await run_hook_line(
             hook_line(Hook.list_models, caps.hook_callbacks),
             HookRunFields(KwargsFields(_NO_KWARGS, _NO_KEYS), run, Field.model_list),

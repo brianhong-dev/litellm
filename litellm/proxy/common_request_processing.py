@@ -4506,7 +4506,7 @@ class ProxyBaseLLMRequestProcessing:
         Extracted as a static method so tests can call the production
         implementation directly rather than reimplementing the closure.
         """
-        run: Final = HookRun[LLMResponseTypes](response=assembled_response)
+        run: Final[HookRun[LLMResponseTypes]] = HookRun(response=assembled_response)
         try:
             from litellm.proxy.proxy_server import llm_router as _global_llm_router
             from litellm.proxy.utils import (
