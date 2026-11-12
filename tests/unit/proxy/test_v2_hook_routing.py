@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import Awaitable, Callable, Generator, Sequence
+from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
 from typing import Final
 
 import pytest
@@ -18,11 +18,10 @@ from litellm.integrations.custom_logger_v2 import (
     Field,
     Hook,
     Patch,
-    build_manifest,
     on,
 )
-from litellm.integrations.custom_logger_v2.host import NativeOutcome, register_native, reset_host_for_tests
-from litellm.proxy._types import UserAPIKeyAuth
+from litellm.integrations.custom_logger_v2.host import NativeOutcome, reset_host_for_tests
+from litellm.proxy._types import ProxyException, UserAPIKeyAuth
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
 from litellm.proxy.utils import ProxyLogging
 from litellm.types.guardrails import GuardrailEventHooks
@@ -42,39 +41,6 @@ def fresh_host() -> Generator[None]:
 @pytest.fixture
 def proxy_logging() -> ProxyLogging:
     return ProxyLogging(user_api_key_cache=DualCache())
-
-
-class _Witness(CustomLoggerV2):
-    def __init__(self, order: list[str]) -> None:
-        self.order = order
-
-    @on(Hook.pre_call, may_abort=True)
-    async def pre_call(self, view: object, ctx: CallContext[object]) -> None:
-        self.order.append("native")
-
-    @on(Hook.during_call, may_abort=True)
-    async def during_call(self, view: object, ctx: CallContext[object]) -> None:
-        self.order.append("native")
-
-    @on(Hook.post_call_success, may_abort=True)
-    async def post_call_success(self, view: object, ctx: CallContext[object]) -> None:
-        self.order.append("native")
-
-    @on(Hook.post_call_failure, may_abort=True)
-    async def post_call_failure(self, view: object, ctx: CallContext[object]) -> None:
-        self.order.append("native")
-
-    @on(Hook.response_headers, writes={Field.response_headers})
-    async def response_headers(self, view: object, ctx: CallContext[object]) -> None:
-        self.order.append("native")
-
-    @on(Hook.list_models, may_abort=True)
-    async def list_models(self, view: object, ctx: CallContext[object]) -> None:
-        self.order.append("native")
-
-    @on(Hook.mcp_tool_result, may_abort=True)
-    async def mcp_tool_result(self, view: object, ctx: CallContext[object]) -> None:
-        self.order.append("native")
 
 
 class _Legacy(CustomLogger):
@@ -131,22 +97,6 @@ class _Legacy(CustomLogger):
     ) -> Sequence[str]:
         self._record(tuple(model_names))
         return ("kept",)
-
-
-class _McpGuardrail(CustomGuardrail):
-    def __init__(self, order: list[str]) -> None:
-        super().__init__(guardrail_name="mcp-witness", default_on=True, event_hook=GuardrailEventHooks.post_mcp_call)
-        self.order = order
-
-    async def apply_guardrail(
-        self,
-        inputs: GenericGuardrailAPIInputs,
-        request_data: dict[str, object],
-        input_type: str,
-        logging_obj: object = None,
-    ) -> GenericGuardrailAPIInputs:
-        self.order.append("legacy")
-        return inputs
 
 
 class _StreamGuardrail(CustomGuardrail):
@@ -249,20 +199,6 @@ async def test_post_call_success_passthrough_propagates_the_legacy_exception(
     assert raised.value is error
 
 
-async def test_post_call_success_native_runs_before_legacy(
-    monkeypatch: pytest.MonkeyPatch, proxy_logging: ProxyLogging
-) -> None:
-    order: Final[list[str]] = []
-    register_native(build_manifest(_Witness(order)))
-    monkeypatch.setattr(litellm, "callbacks", [_Legacy(order)])
-
-    await proxy_logging.post_call_success_hook(
-        data={"model": "gpt-4o"}, response=ModelResponse(), user_api_key_dict=AUTH
-    )
-
-    assert order == ["native", "legacy"]
-
-
 async def test_post_call_failure_passthrough_returns_the_first_legacy_http_exception(
     monkeypatch: pytest.MonkeyPatch, proxy_logging: ProxyLogging
 ) -> None:
@@ -280,20 +216,6 @@ async def test_post_call_failure_passthrough_returns_the_first_legacy_http_excep
     assert legacy.seen[0] is original
 
 
-async def test_post_call_failure_native_runs_before_legacy(
-    monkeypatch: pytest.MonkeyPatch, proxy_logging: ProxyLogging
-) -> None:
-    order: Final[list[str]] = []
-    register_native(build_manifest(_Witness(order)))
-    monkeypatch.setattr(litellm, "callbacks", [_Legacy(order)])
-
-    await proxy_logging.post_call_failure_hook(
-        request_data={"model": "gpt-4o"}, original_exception=RuntimeError("failed"), user_api_key_dict=AUTH
-    )
-
-    assert order == ["native", "legacy"]
-
-
 async def test_response_headers_passthrough_returns_the_legacy_headers(
     monkeypatch: pytest.MonkeyPatch, proxy_logging: ProxyLogging
 ) -> None:
@@ -309,20 +231,6 @@ async def test_response_headers_passthrough_returns_the_legacy_headers(
     assert legacy.seen == [response]
 
 
-async def test_response_headers_native_runs_before_legacy(
-    monkeypatch: pytest.MonkeyPatch, proxy_logging: ProxyLogging
-) -> None:
-    order: Final[list[str]] = []
-    register_native(build_manifest(_Witness(order)))
-    monkeypatch.setattr(litellm, "callbacks", [_Legacy(order, reply={"x-legacy": "1"})])
-
-    await proxy_logging.post_call_response_headers_hook(
-        data={"model": "gpt-4o"}, user_api_key_dict=AUTH, response=ModelResponse()
-    )
-
-    assert order == ["native", "legacy"]
-
-
 async def test_list_models_passthrough_returns_the_names_legacy_hides(
     monkeypatch: pytest.MonkeyPatch, proxy_logging: ProxyLogging
 ) -> None:
@@ -335,18 +243,6 @@ async def test_list_models_passthrough_returns_the_names_legacy_hides(
     assert legacy.seen == [("kept", "hidden")]
 
 
-async def test_list_models_native_runs_before_legacy(
-    monkeypatch: pytest.MonkeyPatch, proxy_logging: ProxyLogging
-) -> None:
-    order: Final[list[str]] = []
-    register_native(build_manifest(_Witness(order)))
-    monkeypatch.setattr(litellm, "callbacks", [_Legacy(order)])
-
-    await proxy_logging.hidden_by_listing_callbacks(AUTH, ["kept"])
-
-    assert order == ["native", "legacy"]
-
-
 async def test_post_mcp_call_passthrough_returns_the_result_untouched_without_guardrails(
     monkeypatch: pytest.MonkeyPatch, proxy_logging: ProxyLogging
 ) -> None:
@@ -356,19 +252,6 @@ async def test_post_mcp_call_passthrough_returns_the_result_untouched_without_gu
     result: Final = await proxy_logging.post_mcp_call_hook(response=response, request_data={}, user_api_key_dict=AUTH)
 
     assert result is response
-
-
-async def test_post_mcp_call_native_runs_before_legacy(
-    monkeypatch: pytest.MonkeyPatch, proxy_logging: ProxyLogging
-) -> None:
-    order: Final[list[str]] = []
-    register_native(build_manifest(_Witness(order)))
-    monkeypatch.setattr(litellm, "callbacks", [_McpGuardrail(order)])
-    response: Final = CallToolResult(content=[TextContent(type="text", text="tool output")])
-
-    await proxy_logging.post_mcp_call_hook(response=response, request_data={"metadata": {}}, user_api_key_dict=AUTH)
-
-    assert order == ["native", "legacy"]
 
 
 async def test_deferred_stream_guardrails_passthrough_dispatches_the_guardrail_replacement(
@@ -391,22 +274,6 @@ async def test_deferred_stream_guardrails_passthrough_dispatches_the_guardrail_r
     assert order == ["legacy"]
     assert dispatch.dispatched == [replacement]
     assert dispatch.dispatched[0] is replacement
-
-
-async def test_deferred_stream_guardrails_native_runs_before_legacy(monkeypatch: pytest.MonkeyPatch) -> None:
-    order: Final[list[str]] = []
-    register_native(build_manifest(_Witness(order)))
-    monkeypatch.setattr(litellm, "callbacks", [_StreamGuardrail(order, None)])
-
-    await ProxyBaseLLMRequestProcessing._run_deferred_stream_guardrails(
-        captured_data={"model": "gpt-4o", "metadata": {}},
-        captured_user_api_key_dict=AUTH,
-        captured_logging_obj=_SuccessDispatch(),
-        assembled_response=ModelResponse(),
-        cache_hit=None,
-    )
-
-    assert order == ["native", "legacy"]
 
 
 async def _drain() -> None:
@@ -838,3 +705,504 @@ async def test_during_call_native_between_legacy_runs_with_them_and_its_abort_wi
 
     assert raised.value.outcome is abort
     assert journal == ["first", "native", "second"]
+
+
+class _Inert(CustomLoggerV2):
+    @on(Hook.post_call_success, may_abort=True)
+    async def post_call_success(self, view: object, ctx: CallContext[object]) -> None:
+        return None
+
+    @on(Hook.post_call_failure, may_abort=True)
+    async def post_call_failure(self, view: object, ctx: CallContext[object]) -> None:
+        return None
+
+    @on(Hook.response_headers, writes={Field.response_headers})
+    async def response_headers(self, view: object, ctx: CallContext[object]) -> None:
+        return None
+
+    @on(Hook.list_models, may_abort=True)
+    async def list_models(self, view: object, ctx: CallContext[object]) -> None:
+        return None
+
+    @on(Hook.mcp_tool_result, may_abort=True)
+    async def mcp_tool_result(self, view: object, ctx: CallContext[object]) -> None:
+        return None
+
+
+def _with_inert(callbacks: list[object], inert: bool) -> list[object]:
+    return [*callbacks[:1], _Inert(), *callbacks[1:]] if inert else callbacks
+
+
+def _read(view: object, name: str) -> object:
+    return getattr(view, name)  # pyright: ignore[reportAny]  # a view exposes each declared field as an attribute
+
+
+class _Patcher(CustomLoggerV2):
+    def __init__(self, replacement: object = None, outcome: Abort | None = None) -> None:
+        self.replacement = replacement
+        self.outcome = outcome
+        self.seen: list[object] = []
+
+    def _answer(self, field: Field, current: object) -> Patch | Abort | None:
+        self.seen.append(current)
+        if self.outcome is not None:
+            return self.outcome
+        return None if self.replacement is None else Patch().set(field, self.replacement)
+
+    @on(Hook.post_call_success, reads={Field.response}, writes={Field.response}, may_abort=True)
+    async def post_call_success(self, view: object, ctx: CallContext[object]) -> Patch | Abort | None:
+        return self._answer(Field.response, _read(view, "response"))
+
+    @on(Hook.post_call_failure, reads={Field.error}, writes={Field.error}, may_abort=True)
+    async def post_call_failure(self, view: object, ctx: CallContext[object]) -> Patch | Abort | None:
+        return self._answer(Field.error, _read(view, "error"))
+
+    @on(Hook.list_models, reads={Field.model_list}, writes={Field.model_list}, may_abort=True)
+    async def list_models(self, view: object, ctx: CallContext[object]) -> Patch | Abort | None:
+        return self._answer(Field.model_list, _read(view, "model_list"))
+
+    @on(Hook.mcp_tool_result, reads={Field.tool_result}, writes={Field.tool_result}, may_abort=True)
+    async def mcp_tool_result(self, view: object, ctx: CallContext[object]) -> Patch | Abort | None:
+        return self._answer(Field.tool_result, _read(view, "tool_result"))
+
+
+class _HeaderMerger(CustomLoggerV2):
+    def __init__(self, headers: dict[str, str]) -> None:
+        self.headers = headers
+        self.seen: list[dict[str, object]] = []
+
+    @on(Hook.response_headers, reads={Field.response_headers}, writes={Field.response_headers})
+    async def response_headers(self, view: object, ctx: CallContext[object]) -> Patch:
+        headers: Final = _read(view, "response_headers")
+        assert isinstance(headers, Mapping)
+        self.seen.append(dict(headers))
+        return Patch().merge(Field.response_headers, self.headers)
+
+
+class _PostGuard(CustomGuardrail):
+    def __init__(
+        self,
+        name: str,
+        journal: list[object],
+        reply: object = None,
+        error: BaseException | None = None,
+        parallel: bool = False,
+        delay: float = 0.0,
+    ) -> None:
+        super().__init__(
+            guardrail_name=name, default_on=True, event_hook=GuardrailEventHooks.post_call, run_in_parallel=parallel
+        )
+        self.name = name
+        self.journal = journal
+        self.reply = reply
+        self.error = error
+        self.delay = delay
+        self.seen: list[object] = []
+
+    async def async_post_call_success_hook(
+        self, data: dict[str, object], user_api_key_dict: UserAPIKeyAuth, response: object
+    ) -> object:
+        self.journal.append(self.name)
+        self.seen.append(response)
+        await asyncio.sleep(self.delay)
+        if self.error is not None:
+            raise self.error
+        self.journal.append(f"{self.name} done")
+        return self.reply
+
+
+class _PostLogger(CustomLogger):
+    def __init__(self, name: str, journal: list[object], reply: object = None) -> None:
+        super().__init__()
+        self.name = name
+        self.journal = journal
+        self.reply = reply
+        self.seen: list[object] = []
+
+    async def async_post_call_success_hook(
+        self, data: dict[str, object], user_api_key_dict: UserAPIKeyAuth, response: object
+    ) -> object:
+        self.journal.append(self.name)
+        self.seen.append(response)
+        return self.reply
+
+
+def _flow_change(name: str) -> SensitiveDataRouteException:
+    return SensitiveDataRouteException(
+        route_to_model=name, session_id="s", guardrail_name=name, sticky_session_routing=False
+    )
+
+
+async def _post_call(proxy_logging: ProxyLogging, response: ModelResponse) -> object:
+    return await proxy_logging.post_call_success_hook(
+        data={"model": "m", "metadata": {}}, response=response, user_api_key_dict=AUTH
+    )
+
+
+@pytest.mark.parametrize("inert", [False, True])
+async def test_post_call_success_runs_guardrails_then_parallel_guardrails_then_loggers_and_chains_replies(
+    monkeypatch: pytest.MonkeyPatch, proxy_logging: ProxyLogging, inert: bool
+) -> None:
+    journal: Final[list[object]] = []
+    from_guardrail: Final = ModelResponse()
+    from_logger: Final = ModelResponse()
+    parallel: Final = _PostGuard("parallel", journal, reply=ModelResponse(), parallel=True)
+    second_logger: Final = _PostLogger("logger-2", journal)
+    callbacks: Final[list[object]] = [
+        _PostLogger("logger-1", journal, reply=from_logger),
+        _PostGuard("guard-1", journal, reply=from_guardrail),
+        parallel,
+        CustomLogger(),
+        second_logger,
+        _PostGuard("guard-2", journal),
+    ]
+    monkeypatch.setattr(litellm, "callbacks", _with_inert(callbacks, inert))
+
+    result: Final = await _post_call(proxy_logging, ModelResponse())
+
+    assert [entry for entry in journal if isinstance(entry, str) and not entry.endswith("done")] == [
+        "guard-1",
+        "guard-2",
+        "parallel",
+        "logger-1",
+        "logger-2",
+    ]
+    assert parallel.seen[0] is from_guardrail
+    assert second_logger.seen[0] is from_logger
+    assert result is from_logger
+
+
+@pytest.mark.parametrize("inert", [False, True])
+async def test_post_call_success_parallel_guardrails_wait_for_each_other_and_the_first_block_in_list_order_wins(
+    monkeypatch: pytest.MonkeyPatch, proxy_logging: ProxyLogging, inert: bool
+) -> None:
+    journal: Final[list[object]] = []
+    slow_block: Final = ValueError("slow but first")
+    callbacks: Final[list[object]] = [
+        _PostGuard("flow", journal, error=_flow_change("flow"), parallel=True),
+        _PostGuard("slow", journal, error=slow_block, parallel=True, delay=0.02),
+        _PostGuard("fast", journal, error=HTTPException(status_code=400), parallel=True),
+        _PostGuard("passes", journal, parallel=True, delay=0.03),
+        _PostLogger("logger", journal),
+    ]
+    monkeypatch.setattr(litellm, "callbacks", _with_inert(callbacks, inert))
+
+    with pytest.raises(ValueError, match="slow but first") as raised:
+        await _post_call(proxy_logging, ModelResponse())
+
+    assert raised.value is slow_block
+    assert "passes done" in journal
+    assert "logger" not in journal
+
+
+@pytest.mark.parametrize("inert", [False, True])
+async def test_post_call_success_parallel_flow_change_propagates_only_when_nothing_blocked(
+    monkeypatch: pytest.MonkeyPatch, proxy_logging: ProxyLogging, inert: bool
+) -> None:
+    journal: Final[list[object]] = []
+    first: Final = _flow_change("first")
+    callbacks: Final[list[object]] = [
+        _PostGuard("first", journal, error=first, parallel=True, delay=0.02),
+        _PostGuard("second", journal, error=_flow_change("second"), parallel=True),
+        _PostLogger("logger", journal),
+    ]
+    monkeypatch.setattr(litellm, "callbacks", _with_inert(callbacks, inert))
+
+    with pytest.raises(SensitiveDataRouteException) as raised:
+        await _post_call(proxy_logging, ModelResponse())
+
+    assert raised.value is first
+    assert "logger" not in journal
+
+
+async def test_post_call_success_native_between_two_loggers_sees_the_first_reply_and_the_second_sees_its_patch(
+    monkeypatch: pytest.MonkeyPatch, proxy_logging: ProxyLogging
+) -> None:
+    from_first: Final = ModelResponse()
+    from_native: Final = ModelResponse()
+    native: Final = _Patcher(replacement=from_native)
+    second: Final = _PostLogger("second", [])
+    monkeypatch.setattr(litellm, "callbacks", [_PostLogger("first", [], reply=from_first), native, second])
+
+    result: Final = await _post_call(proxy_logging, ModelResponse())
+
+    assert native.seen[0] is from_first
+    assert second.seen[0] is from_native
+    assert result is from_native
+
+
+async def test_post_call_success_native_abort_stops_the_loggers_after_it(
+    monkeypatch: pytest.MonkeyPatch, proxy_logging: ProxyLogging
+) -> None:
+    journal: Final[list[object]] = []
+    abort: Final = Abort(status=400, message="unsafe output")
+    monkeypatch.setattr(
+        litellm,
+        "callbacks",
+        [_PostLogger("before", journal), _Patcher(outcome=abort), _PostLogger("after", journal)],
+    )
+
+    with pytest.raises(NativeOutcome) as raised:
+        await _post_call(proxy_logging, ModelResponse())
+
+    assert raised.value.outcome is abort
+    assert journal == ["before"]
+
+
+@pytest.mark.parametrize("inert", [False, True])
+async def test_post_call_failure_calls_every_logger_and_the_first_http_exception_wins(
+    monkeypatch: pytest.MonkeyPatch, proxy_logging: ProxyLogging, inert: bool
+) -> None:
+    order: Final[list[str]] = []
+    raised_first: Final = HTTPException(status_code=429, detail="raised first")
+    callbacks: Final[list[object]] = [
+        _Legacy(order, error=RuntimeError("swallowed")),
+        "not-a-known-integration",
+        _Legacy(order, reply="not an exception"),
+        _Legacy(order, error=raised_first),
+        _passes,
+        _Legacy(order, reply=HTTPException(status_code=418, detail="returned later")),
+    ]
+    monkeypatch.setattr(litellm, "callbacks", _with_inert(callbacks, inert))
+
+    result: Final = await proxy_logging.post_call_failure_hook(
+        request_data={"model": "m"}, original_exception=RuntimeError("upstream"), user_api_key_dict=AUTH
+    )
+
+    assert result is raised_first
+    assert order == ["legacy", "legacy", "legacy", "legacy"]
+
+
+async def test_post_call_failure_native_between_two_loggers_rewrites_the_error_the_second_sees(
+    monkeypatch: pytest.MonkeyPatch, proxy_logging: ProxyLogging
+) -> None:
+    original: Final = RuntimeError("upstream")
+    rewritten: Final = RuntimeError("rewritten by the native")
+    first: Final = _Legacy([])
+    native: Final = _Patcher(replacement=rewritten)
+    second: Final = _Legacy([])
+    monkeypatch.setattr(litellm, "callbacks", [first, native, second])
+
+    result: Final = await proxy_logging.post_call_failure_hook(
+        request_data={"model": "m"}, original_exception=original, user_api_key_dict=AUTH
+    )
+
+    assert result is None
+    assert first.seen[0] is original
+    assert native.seen[0] is original
+    assert second.seen[0] is rewritten
+
+
+@pytest.mark.parametrize("inert", [False, True])
+async def test_response_headers_merge_in_list_order_and_a_failure_keeps_what_was_merged(
+    monkeypatch: pytest.MonkeyPatch, proxy_logging: ProxyLogging, inert: bool
+) -> None:
+    order: Final[list[str]] = []
+    callbacks: Final[list[object]] = [
+        _Legacy(order, reply={"x-a": "1", "x-b": "1"}),
+        CustomLogger(),
+        _Legacy(order, reply={"x-b": "2"}),
+        _Legacy(order, error=RuntimeError("header hook failed")),
+        _Legacy(order, reply={"x-c": "never"}),
+    ]
+    monkeypatch.setattr(litellm, "callbacks", _with_inert(callbacks, inert))
+
+    result: Final = await proxy_logging.post_call_response_headers_hook(
+        data={"model": "m"}, user_api_key_dict=AUTH, response=ModelResponse()
+    )
+
+    assert result == {"x-a": "1", "x-b": "2"}
+    assert order == ["legacy", "legacy", "legacy"]
+
+
+async def test_response_headers_native_between_two_loggers_adds_headers_and_later_entries_win(
+    monkeypatch: pytest.MonkeyPatch, proxy_logging: ProxyLogging
+) -> None:
+    native: Final = _HeaderMerger({"x-b": "native", "x-n": "native"})
+    monkeypatch.setattr(
+        litellm,
+        "callbacks",
+        [_Legacy([], reply={"x-a": "1", "x-b": "1"}), native, _Legacy([], reply={"x-n": "2"})],
+    )
+
+    result: Final = await proxy_logging.post_call_response_headers_hook(
+        data={"model": "m"}, user_api_key_dict=AUTH, response=ModelResponse()
+    )
+
+    assert native.seen == [{"x-a": "1", "x-b": "1"}]
+    assert result == {"x-a": "1", "x-b": "native", "x-n": "2"}
+
+
+class _Lister(CustomLogger):
+    def __init__(self, journal: list[object], hides: frozenset[str] = frozenset(), reply: object = None) -> None:
+        super().__init__()
+        self.journal = journal
+        self.hides = hides
+        self.reply = reply
+
+    async def async_filter_listed_models(
+        self, user_api_key_dict: UserAPIKeyAuth, model_names: Sequence[str]
+    ) -> Sequence[str]:
+        self.journal.append(tuple(model_names))
+        if self.reply is not None:
+            return self.reply  # pyright: ignore[reportReturnType]  # a malformed return is the case under test
+        return tuple(name for name in model_names if name not in self.hides)
+
+
+@pytest.mark.parametrize("inert", [False, True])
+async def test_list_models_filters_see_the_previous_output_and_stop_once_nothing_is_left(
+    monkeypatch: pytest.MonkeyPatch, proxy_logging: ProxyLogging, inert: bool
+) -> None:
+    journal: Final[list[object]] = []
+    callbacks: Final[list[object]] = [
+        _Lister(journal, hides=frozenset({"b"})),
+        CustomLogger(),
+        _Lister(journal, hides=frozenset({"a", "c"})),
+        _Lister(journal),
+    ]
+    monkeypatch.setattr(litellm, "callbacks", _with_inert(callbacks, inert))
+
+    hidden: Final = await proxy_logging.hidden_by_listing_callbacks(AUTH, ["a", "b", "c"])
+
+    assert hidden == frozenset({"a", "b", "c"})
+    assert journal == [("a", "b", "c"), ("a", "c")]
+
+
+@pytest.mark.parametrize("inert", [False, True])
+async def test_list_models_malformed_return_raises_500_and_stops_the_filters(
+    monkeypatch: pytest.MonkeyPatch, proxy_logging: ProxyLogging, inert: bool
+) -> None:
+    journal: Final[list[object]] = []
+    monkeypatch.setattr(litellm, "callbacks", _with_inert([_Lister(journal, reply=42), _Lister(journal)], inert))
+
+    with pytest.raises(ProxyException) as raised:
+        await proxy_logging.hidden_by_listing_callbacks(AUTH, ["a"])
+
+    assert raised.value.code == "500"
+    assert journal == [("a",)]
+
+
+async def test_list_models_native_between_two_filters_narrows_what_the_second_sees(
+    monkeypatch: pytest.MonkeyPatch, proxy_logging: ProxyLogging
+) -> None:
+    journal: Final[list[object]] = []
+    native: Final = _Patcher(replacement=("c",))
+    monkeypatch.setattr(litellm, "callbacks", [_Lister(journal, hides=frozenset({"a"})), native, _Lister(journal)])
+
+    hidden: Final = await proxy_logging.hidden_by_listing_callbacks(AUTH, ["a", "b", "c"])
+
+    assert native.seen == [("b", "c")]
+    assert journal == [("a", "b", "c"), ("c",)]
+    assert hidden == frozenset({"a", "b"})
+
+
+class _McpSuffix(CustomGuardrail):
+    def __init__(self, suffix: str) -> None:
+        super().__init__(guardrail_name=f"mcp{suffix}", default_on=True, event_hook=GuardrailEventHooks.post_mcp_call)
+        self.suffix = suffix
+        self.seen: list[list[str]] = []
+
+    async def apply_guardrail(
+        self,
+        inputs: GenericGuardrailAPIInputs,
+        request_data: dict[str, object],
+        input_type: str,
+        logging_obj: object = None,
+    ) -> GenericGuardrailAPIInputs:
+        texts: Final = list(inputs.get("texts") or [])
+        self.seen.append(texts)
+        return GenericGuardrailAPIInputs(texts=[f"{text}{self.suffix}" for text in texts])
+
+
+def _tool_result(text: str) -> CallToolResult:
+    return CallToolResult(content=[TextContent(type="text", text=text)])
+
+
+def _texts(result: CallToolResult) -> list[str]:
+    return [item.text for item in result.content if isinstance(item, TextContent)]
+
+
+@pytest.mark.parametrize("inert", [False, True])
+async def test_post_mcp_call_guardrails_run_in_list_order_on_the_previous_result(
+    monkeypatch: pytest.MonkeyPatch, proxy_logging: ProxyLogging, inert: bool
+) -> None:
+    second: Final = _McpSuffix("-2")
+    monkeypatch.setattr(litellm, "callbacks", _with_inert([_McpSuffix("-1"), CustomLogger(), second], inert))
+
+    result: Final = await proxy_logging.post_mcp_call_hook(
+        response=_tool_result("out"), request_data={"metadata": {}}, user_api_key_dict=AUTH
+    )
+
+    assert second.seen == [["out-1"]]
+    assert _texts(result) == ["out-1-2"]
+
+
+async def test_post_mcp_call_native_between_two_guardrails_replaces_the_result_the_second_scans(
+    monkeypatch: pytest.MonkeyPatch, proxy_logging: ProxyLogging
+) -> None:
+    replacement: Final = _tool_result("from native")
+    native: Final = _Patcher(replacement=replacement)
+    second: Final = _McpSuffix("-2")
+    monkeypatch.setattr(litellm, "callbacks", [_McpSuffix("-1"), native, second])
+
+    result: Final = await proxy_logging.post_mcp_call_hook(
+        response=_tool_result("out"), request_data={"metadata": {}}, user_api_key_dict=AUTH
+    )
+
+    seen_by_native: Final = native.seen[0]
+    assert isinstance(seen_by_native, CallToolResult)
+    assert _texts(seen_by_native) == ["out-1"]
+    assert second.seen == [["from native"]]
+    assert result is replacement
+    assert _texts(result) == ["from native-2"]
+
+
+async def _deferred(dispatch: _SuccessDispatch) -> None:
+    await ProxyBaseLLMRequestProcessing._run_deferred_stream_guardrails(
+        captured_data={"model": "m", "metadata": {}},
+        captured_user_api_key_dict=AUTH,
+        captured_logging_obj=dispatch,
+        assembled_response=ModelResponse(),
+        cache_hit=None,
+    )
+    await _drain()
+
+
+@pytest.mark.parametrize("inert", [False, True])
+async def test_deferred_stream_guardrails_run_one_at_a_time_and_a_block_is_logged_then_success_is_dispatched(
+    monkeypatch: pytest.MonkeyPatch, inert: bool
+) -> None:
+    journal: Final[list[object]] = []
+    replacement: Final = ModelResponse()
+    last: Final = _PostGuard("last", journal)
+    callbacks: Final[list[object]] = [
+        _PostGuard("parallel", journal, reply=replacement, parallel=True, delay=0.01),
+        _PostGuard("blocker", journal, error=HTTPException(status_code=400, detail="blocked")),
+        last,
+    ]
+    monkeypatch.setattr(litellm, "callbacks", _with_inert(callbacks, inert))
+    dispatch: Final = _SuccessDispatch()
+
+    await _deferred(dispatch)
+
+    assert journal == ["parallel", "parallel done", "blocker", "last", "last done"]
+    assert last.seen[0] is replacement
+    assert dispatch.model_call_details["metadata"] == {"guardrail_blocked": True}
+    assert dispatch.dispatched == [replacement]
+
+
+async def test_deferred_stream_native_between_two_guardrails_patches_what_the_second_sees_and_what_is_logged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from_first: Final = ModelResponse()
+    from_native: Final = ModelResponse()
+    native: Final = _Patcher(replacement=from_native)
+    second: Final = _PostGuard("second", [])
+    monkeypatch.setattr(litellm, "callbacks", [_PostGuard("first", [], reply=from_first), native, second])
+    dispatch: Final = _SuccessDispatch()
+
+    await _deferred(dispatch)
+
+    assert native.seen[0] is from_first
+    assert second.seen[0] is from_native
+    assert dispatch.dispatched == [from_native]

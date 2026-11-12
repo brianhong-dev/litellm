@@ -159,9 +159,10 @@ from litellm.integrations.custom_guardrail import (
 )
 from litellm.integrations.custom_logger import CustomLogger, overrides_hook
 from litellm.integrations.custom_logger_v2.enums import Field, Hook
-from litellm.integrations.custom_logger_v2.host import run_legacy_hook
 from litellm.integrations.custom_logger_v2.legacy import (
     PROXY_REQUEST_KEYS,
+    Admit,
+    HookLine,
     KwargsFields,
     adapter_for,
     hook_line,
@@ -170,8 +171,14 @@ from litellm.integrations.custom_logger_v2.legacy import (
     run_line,
 )
 from litellm.integrations.custom_logger_v2.logger import CustomLoggerV2
-from litellm.integrations.custom_logger_v2.outcomes import Patch
-from litellm.integrations.custom_logger_v2.patches import apply_patch
+from litellm.integrations.custom_logger_v2.outcomes import (
+    MERGEABLE_FIELDS,
+    InvalidPatchError,
+    MergeField,
+    Patch,
+    PatchOp,
+)
+from litellm.integrations.custom_logger_v2.patches import LiveFields, apply_patch
 from litellm.integrations.prometheus import PrometheusLogger
 from litellm.integrations.SlackAlerting.slack_alerting import SlackAlerting
 from litellm.integrations.SlackAlerting.utils import add_langfuse_trace_id_to_alert
@@ -1931,23 +1938,6 @@ class MalformedListingFilterReturn:
     tag: Literal["malformed_listing_filter_return"] = "malformed_listing_filter_return"
 
 
-async def _names_kept_by_listing_callbacks(
-    callbacks: Sequence[CustomLogger],
-    user_api_key_dict: UserAPIKeyAuth,
-    model_names: tuple[str, ...],
-) -> tuple[str, ...] | MalformedListingFilterReturn:
-    if not callbacks or not model_names:
-        return model_names
-    returned: Final = await callbacks[0].async_filter_listed_models(user_api_key_dict, model_names)
-    try:
-        kept: Final = frozenset(_LISTED_MODEL_NAMES.validate_python(returned))
-    except ValidationError:
-        return MalformedListingFilterReturn(callback=type(callbacks[0]).__name__)
-    return await _names_kept_by_listing_callbacks(
-        callbacks[1:], user_api_key_dict, tuple(name for name in model_names if name in kept)
-    )
-
-
 def _raise_malformed_listing_filter_return(error: MalformedListingFilterReturn) -> NoReturn:
     raise ProxyException(
         message=f"{error.callback}.async_filter_listed_models must return a sequence of model names",
@@ -2009,6 +1999,122 @@ class _PreCallRun:
         )
         if raised is not None:
             raise raised
+
+
+@dataclass(slots=True, eq=False)
+class HookRun(Generic[_T]):
+    response: _T
+    flow_changes: list[list[BaseException]] = field(  # mutable-ok: one slot per parallel guardrail in list order
+        default_factory=list
+    )
+    transformed: HTTPException | None = None
+
+    def raise_flow_change(self) -> None:
+        raised: Final = next((slot[0] for slot in self.flow_changes if slot), None)
+        if raised is not None:
+            raise raised
+
+    def hold(self, response: _T) -> None:
+        self.response = response
+
+    def adopt(self, reply: _T | None) -> None:
+        if reply is not None:
+            self.response = reply
+
+    def keep_first(self, error: HTTPException) -> None:
+        if self.transformed is None:
+            self.transformed = error
+
+    def parallel_slot(self) -> list[BaseException]:  # mutable-ok: filled with one guardrail's flow change
+        slot: Final[list[BaseException]] = []  # mutable-ok: see above
+        self.flow_changes.append(slot)
+        return slot
+
+
+@dataclass(slots=True, eq=False)
+class _PostCallGuardrails:
+    data: dict[str, object]  # mutable-ok: guardrail_to_apply is written into the live request
+    guardrail_data: dict[str, object]  # mutable-ok: the request merged with model-level guardrails
+    request_view: Mapping[str, object]
+    pipeline_managed: frozenset[str]
+    user_api_key_dict: UserAPIKeyAuth
+    parallel_view: Mapping[str, object] | None = None
+
+    def parallel_request_view(self) -> Mapping[str, object]:
+        if self.parallel_view is None:
+            self.parallel_view = _REQUEST_FIELDS.validate_python(self.data)
+        return self.parallel_view
+
+
+class HookRunFields(LiveFields, Generic[_T]):
+    __slots__ = ("_kwargs", "_run", "_slot")
+
+    def __init__(self, kwargs: KwargsFields, run: HookRun[_T], slot: Field) -> None:
+        self._kwargs: Final = kwargs
+        self._run: Final = run
+        self._slot: Final = slot
+
+    def _held(self, field: Field) -> bool:
+        return field is self._slot or field is Field.deprecated_response_obj
+
+    def __getitem__(self, field: Field) -> object:
+        return self._run.response if self._held(field) else self._kwargs[field]
+
+    def __iter__(self) -> Iterator[Field]:
+        return iter((*self._kwargs, Field.deprecated_response_obj, self._slot))
+
+    def __len__(self) -> int:
+        return len(self._kwargs) + 2
+
+    def apply(self, patch: Patch) -> Mapping[Field, object]:
+        for op in patch.ops:
+            self._apply_op(op)
+        return self
+
+    def _apply_op(self, op: PatchOp) -> None:
+        if not self._held(op.field):
+            if op.field is Field.deprecated_kwargs:
+                raise InvalidPatchError("this hook keeps the request it was given")
+            _ = self._kwargs.apply(Patch((op,)))
+            return
+        if isinstance(op, MergeField):
+            self._merge(op.keys)
+            return
+        if self._slot in MERGEABLE_FIELDS:
+            raise InvalidPatchError(f"{self._slot.value} is add-only here, so merge keys into it")
+        self._run.hold(op.value)  # pyright: ignore[reportArgumentType]  # a native patch carries an untyped value
+
+    def _merge(self, keys: Mapping[str, object]) -> None:
+        current: Final = self._run.response
+        if not isinstance(current, dict):
+            raise InvalidPatchError(f"{self._slot.value} holds no mapping here, so keys cannot be merged into it")
+        cast("dict[str, object]", current).update(keys)  # cast-ok: merged headers are str-keyed
+
+
+_NO_KWARGS: Final[Mapping[str, object]] = MappingProxyType({})
+_NO_KEYS: Final[Mapping[Field, str]] = MappingProxyType({})
+
+
+def _resolved_logger(callback: object) -> CustomLogger | None:
+    resolved: Final = (
+        litellm.litellm_core_utils.litellm_logging.get_custom_logger_compatible_class(
+            cast(_custom_logger_compatible_callbacks_literal, callback)  # cast-ok: unknown names resolve to None
+        )
+        if isinstance(callback, str)
+        else callback
+    )
+    return resolved if isinstance(resolved, CustomLogger) else None
+
+
+def hook_fields(kwargs: object, run: HookRun[_T], slot: Field) -> HookRunFields[_T]:
+    return HookRunFields(KwargsFields(kwargs, PROXY_REQUEST_KEYS), run, slot)
+
+
+async def run_hook_line(
+    line: HookLine, fields: Mapping[Field, object], binding: Callable[[object, object], Awaitable[None] | None]
+) -> None:
+    if line.entries:
+        _ = kwargs_after(await run_line(line, fields, binding))
 
 
 class ProxyLogging:
@@ -4181,59 +4287,44 @@ class ProxyLogging:
 
         redacted_traceback_str: Final = redact_string(traceback_str) if traceback_str is not None else None
 
-        return await run_legacy_hook(
-            Hook.post_call_failure,
-            lambda _patches: self._legacy_post_call_failure(
-                request_data=request_data,
-                original_exception=original_exception,
-                user_api_key_dict=user_api_key_dict,
-                redacted_traceback_str=redacted_traceback_str,
-            ),
+        callbacks: Final = litellm.callbacks
+        line: Final = hook_line(Hook.post_call_failure, callbacks, admit=Admit.every_entry)
+        run: Final = HookRun[Exception](response=original_exception)
+        await run_hook_line(
+            line,
+            hook_fields(request_data, run, Field.error),
+            partial(self._post_call_failure_one, run, request_data, user_api_key_dict, redacted_traceback_str),
         )
+        return run.transformed
 
-    async def _legacy_post_call_failure(
+    async def _post_call_failure_one(
         self,
+        run: HookRun[Exception],
         request_data: dict[str, object],  # mutable-ok: same request-payload shape as post_call_failure_hook's
-        original_exception: Exception,
         user_api_key_dict: UserAPIKeyAuth,
         redacted_traceback_str: str | None,
-    ) -> HTTPException | None:
-        # Track the first HTTPException returned or raised by any callback
-        transformed_exception: HTTPException | None = None
-
-        for callback in litellm.callbacks:
+        callback: object,
+        request: object,
+    ) -> None:
+        try:
+            resolved: Final = _resolved_logger(callback)
+            if resolved is None:
+                return
             try:
-                _callback: CustomLogger | None = None
-                if isinstance(callback, str):
-                    _callback = litellm.litellm_core_utils.litellm_logging.get_custom_logger_compatible_class(
-                        cast(_custom_logger_compatible_callbacks_literal, callback)
-                    )
-                else:
-                    _callback = callback
-                if _callback is not None and isinstance(_callback, CustomLogger):
-                    try:
-                        hook_result = await _callback.async_post_call_failure_hook(
-                            request_data=request_data,
-                            user_api_key_dict=user_api_key_dict,
-                            original_exception=original_exception,
-                            traceback_str=redacted_traceback_str,
-                        )
-                        # If callback returned an HTTPException, use it (first one wins)
-                        if isinstance(hook_result, HTTPException) and transformed_exception is None:
-                            transformed_exception = hook_result
-                    except HTTPException as e:
-                        # If callback raised an HTTPException, use it (first one wins)
-                        if transformed_exception is None:
-                            transformed_exception = e
-                    except Exception as e:
-                        # Log non-HTTPException errors from callbacks but don't break the flow
-                        verbose_proxy_logger.exception(
-                            "[Non-Blocking] Error in async_post_call_failure_hook callback: %s", e
-                        )
+                hook_result: Final = await resolved.async_post_call_failure_hook(
+                    request_data=request_data,
+                    user_api_key_dict=user_api_key_dict,
+                    original_exception=run.response,
+                    traceback_str=redacted_traceback_str,
+                )
+                if isinstance(hook_result, HTTPException):
+                    run.keep_first(hook_result)
+            except HTTPException as e:
+                run.keep_first(e)
             except Exception as e:
-                verbose_proxy_logger.exception("[Non-Blocking] Error setting up post_call_failure_hook callback: %s", e)
-
-        return transformed_exception
+                verbose_proxy_logger.exception("[Non-Blocking] Error in async_post_call_failure_hook callback: %s", e)
+        except Exception as e:
+            verbose_proxy_logger.exception("[Non-Blocking] Error setting up post_call_failure_hook callback: %s", e)
 
     def _is_proxy_only_llm_api_error(
         self,
@@ -4470,183 +4561,129 @@ class ProxyLogging:
         4. /files
         """
 
-        return await run_legacy_hook(
-            Hook.post_call_success,
-            lambda _patches: self._legacy_post_call_success(
-                data=data,
-                response=response,
-                user_api_key_dict=user_api_key_dict,
-            ),
-        )
-
-    async def _legacy_post_call_success(
-        self,
-        data: dict[str, object],  # mutable-ok: same request-payload shape as post_call_success_hook's data
-        response: LLMResponseTypes,
-        user_api_key_dict: UserAPIKeyAuth,
-    ) -> LLMResponseTypes:
         from litellm.proxy.proxy_server import llm_router
-        from litellm.types.guardrails import GuardrailEventHooks
 
+        run: Final = HookRun[LLMResponseTypes](response=response)
         pipeline_response: Final = await self._run_post_call_pipelines(
             data=data,
             user_api_key_dict=user_api_key_dict,
             response=response,
         )
-        if pipeline_response is not None:
-            response = pipeline_response  # rebind-ok: adopt the pipeline's replacement response, same contract as the callback loops below
+        run.adopt(pipeline_response)
 
         pipeline_managed: Final = pipeline_managed_guardrail_names(data, "post_call")
         request_view: Final = _REQUEST_FIELDS.validate_python(data)
         guardrail_callbacks, other_callbacks = _partition_post_call_callbacks()
-        try:
-            # Merge model-level guardrails before checking which guardrails to run
-            guardrail_data: Final = check_and_merge_model_level_guardrails(data=data, llm_router=llm_router)
-
-            parallel_guardrails: Final[tuple[CustomGuardrail, ...]] = tuple(
-                callback
-                for callback in guardrail_callbacks
-                if getattr(callback, "run_in_parallel", False)
-                and not (callback.guardrail_name and callback.guardrail_name in pipeline_managed)
-            )
-
-            for callback in guardrail_callbacks:
-                # Main - V2 Guardrails implementation
-
-                if callback.guardrail_name and callback.guardrail_name in pipeline_managed:
-                    continue
-
-                if getattr(callback, "run_in_parallel", False):
-                    continue
-
-                if (
-                    callback.should_run_guardrail(
-                        data=guardrail_data,
-                        event_type=GuardrailEventHooks.post_call,
-                    )
-                    is not True
-                ):
-                    continue
-
-                if callback.post_call_already_checked(request_view, response) is True:
-                    continue
-
-                guardrail_response: Any | None = None
-
-                if routes_through_apply_guardrail(callback):
-                    data["guardrail_to_apply"] = callback
-                    guardrail_response = await self._run_guardrail_with_metrics(
-                        callback,
-                        unified_guardrail.async_post_call_success_hook(
-                            user_api_key_dict=user_api_key_dict,
-                            data=data,
-                            response=response,
-                        ),
-                        "post_call",
-                        request_data=data,
-                    )
-                else:
-                    guardrail_response = await self._run_guardrail_with_metrics(
-                        callback,
-                        callback.async_post_call_success_hook(
-                            user_api_key_dict=user_api_key_dict,
-                            data=data,
-                            response=response,
-                        ),
-                        "post_call",
-                        request_data=data,
-                    )
-
-                if guardrail_response is not None:
-                    response = guardrail_response
-
-            if parallel_guardrails:
-                await self._run_parallel_post_call_guardrails(
-                    guardrails=parallel_guardrails,
-                    data=data,
-                    guardrail_data=guardrail_data,
-                    response=response,
-                    user_api_key_dict=user_api_key_dict,
-                )
-
-            ############ Handle CustomLogger ###############################
-            #################################################################
-
-            for callback in other_callbacks:
-                if not _overrides_hook(callback, "async_post_call_success_hook"):
-                    continue
-                callback_response: LLMResponseTypes | None = await callback.async_post_call_success_hook(
-                    user_api_key_dict=user_api_key_dict, data=data, response=response
-                )
-                if callback_response is not None:
-                    response = callback_response
-        except Exception as e:
-            raise e
-        return response
-
-    async def _run_parallel_post_call_guardrails(
-        self,
-        guardrails: tuple[CustomGuardrail, ...],
-        data: dict,
-        guardrail_data: dict,
-        response: LLMResponseTypes,
-        user_api_key_dict: UserAPIKeyAuth,
-    ) -> None:
-        """
-        Run opted-in post_call guardrails concurrently against the response
-        produced by the sequential guardrails. These guardrails are declared
-        block-only, so any modified response they return is discarded; they run
-        for their blocking side effect (raising to reject the response before it
-        reaches the client). Every guardrail is awaited to completion
-        (``return_exceptions=True``) so a raise by one never leaves the others
-        running as unobserved background tasks. A guardrail that blocks (any
-        exception other than a passthrough) takes precedence over one that only
-        changes the response flow, so a fast passthrough can never let a slower
-        block be bypassed. Each per-guardrail coroutine sets ``guardrail_to_apply``
-        immediately before awaiting, and the unified hook pops it before its first
-        suspension point, so concurrent guardrails never race on that key.
-        """
-        request_view: Final = _REQUEST_FIELDS.validate_python(data)
-
-        async def _run_one(callback: CustomGuardrail) -> None:
-            if callback.should_run_guardrail(data=guardrail_data, event_type=GuardrailEventHooks.post_call) is not True:
-                return
-            if callback.post_call_already_checked(request_view, response) is True:
-                return
-            if routes_through_apply_guardrail(callback):
-                data["guardrail_to_apply"] = callback
-                await self._run_guardrail_with_metrics(
-                    callback,
-                    unified_guardrail.async_post_call_success_hook(
-                        user_api_key_dict=user_api_key_dict,
-                        data=data,
-                        response=response,
-                    ),
-                    "post_call",
-                    request_data=data,
-                )
-            else:
-                await self._run_guardrail_with_metrics(
-                    callback,
-                    callback.async_post_call_success_hook(
-                        user_api_key_dict=user_api_key_dict,
-                        data=data,
-                        response=response,
-                    ),
-                    "post_call",
-                    request_data=data,
-                )
-
-        results: Final = await asyncio.gather(
-            *(_run_one(callback) for callback in guardrails),
-            return_exceptions=True,
+        guardrails: Final = _PostCallGuardrails(
+            data=data,
+            guardrail_data=check_and_merge_model_level_guardrails(data=data, llm_router=llm_router),
+            request_view=request_view,
+            pipeline_managed=pipeline_managed,
+            user_api_key_dict=user_api_key_dict,
         )
-        raised: Final = tuple(result for result in results if isinstance(result, BaseException))
-        blocking: Final = next((exc for exc in raised if not _exception_changes_request_flow(exc)), None)
-        if blocking is not None:
-            raise blocking
-        if raised:
-            raise raised[0]
+        fields: Final = hook_fields(data, run, Field.response)
+        await run_hook_line(
+            hook_line(Hook.post_call_success, guardrail_callbacks),
+            fields,
+            partial(self._post_call_guardrail_start, run, guardrails),
+        )
+        run.raise_flow_change()
+        await run_hook_line(
+            hook_line(Hook.post_call_success, other_callbacks),
+            fields,
+            partial(self._post_call_logger, run, data, user_api_key_dict),
+        )
+        return run.response
+
+    def _post_call_guardrail_start(
+        self, run: HookRun[LLMResponseTypes], guardrails: "_PostCallGuardrails", callback: object, request: object
+    ) -> Awaitable[None] | None:
+        if not isinstance(callback, CustomGuardrail):
+            return None
+        if callback.guardrail_name and callback.guardrail_name in guardrails.pipeline_managed:
+            return None
+        if not adapter_for(callback).parallel:
+            return self._post_call_sequential_guardrail(run, guardrails, callback)
+        return self._post_call_parallel_guardrail(
+            run, guardrails, callback, guardrails.parallel_request_view(), run.parallel_slot()
+        )
+
+    async def _post_call_sequential_guardrail(
+        self, run: HookRun[LLMResponseTypes], guardrails: "_PostCallGuardrails", callback: CustomGuardrail
+    ) -> None:
+        if (
+            callback.should_run_guardrail(data=guardrails.guardrail_data, event_type=GuardrailEventHooks.post_call)
+            is not True
+        ):
+            return
+        if callback.post_call_already_checked(guardrails.request_view, run.response) is True:
+            return
+        run.adopt(await self._post_call_guardrail(guardrails, callback, run.response))
+
+    async def _post_call_parallel_guardrail(
+        self,
+        run: HookRun[LLMResponseTypes],
+        guardrails: "_PostCallGuardrails",
+        callback: CustomGuardrail,
+        request_view: Mapping[str, object],
+        slot: list[BaseException],  # mutable-ok: see _post_call_guardrail_start
+    ) -> None:
+        try:
+            if (
+                callback.should_run_guardrail(data=guardrails.guardrail_data, event_type=GuardrailEventHooks.post_call)
+                is not True
+            ):
+                return
+            if callback.post_call_already_checked(request_view, run.response) is True:
+                return
+            _ = await self._post_call_guardrail(guardrails, callback, run.response)
+        except BaseException as e:
+            if not _exception_changes_request_flow(e):
+                raise
+            slot.append(e)
+
+    async def _post_call_guardrail(
+        self, guardrails: "_PostCallGuardrails", callback: CustomGuardrail, response: LLMResponseTypes
+    ) -> LLMResponseTypes | None:
+        data: Final = guardrails.data
+        if routes_through_apply_guardrail(callback):
+            data["guardrail_to_apply"] = callback
+            return await self._run_guardrail_with_metrics(  # pyright: ignore[reportReturnType]  # unified hook is untyped
+                callback,
+                unified_guardrail.async_post_call_success_hook(
+                    user_api_key_dict=guardrails.user_api_key_dict,
+                    data=data,
+                    response=response,
+                ),
+                "post_call",
+                request_data=data,
+            )
+        return await self._run_guardrail_with_metrics(
+            callback,
+            callback.async_post_call_success_hook(
+                user_api_key_dict=guardrails.user_api_key_dict,
+                data=data,
+                response=response,
+            ),
+            "post_call",
+            request_data=data,
+        )
+
+    async def _post_call_logger(
+        self,
+        run: HookRun[LLMResponseTypes],
+        data: dict[str, object],  # mutable-ok: same request-payload shape as post_call_success_hook's data
+        user_api_key_dict: UserAPIKeyAuth,
+        callback: object,
+        request: object,
+    ) -> None:
+        if not isinstance(callback, CustomLogger):
+            return
+        run.adopt(
+            await callback.async_post_call_success_hook(
+                user_api_key_dict=user_api_key_dict, data=data, response=run.response
+            )
+        )
 
     async def post_mcp_call_hook(
         self,
@@ -4669,23 +4706,8 @@ class ProxyLogging:
         (matching the inbound ``pre_mcp_call`` behavior) rather than being
         swallowed into an unguarded result.
         """
-        return await run_legacy_hook(
-            Hook.mcp_tool_result,
-            lambda _patches: self._legacy_post_mcp_call(
-                response=response,
-                request_data=request_data,
-                user_api_key_dict=user_api_key_dict,
-            ),
-        )
-
-    async def _legacy_post_mcp_call(
-        self,
-        response: "CallToolResult",
-        request_data: Mapping[str, Any],
-        user_api_key_dict: UserAPIKeyAuth | None,
-    ) -> "CallToolResult":
         caps: Final = ProxyLogging.callback_capabilities()
-        if not caps.has_guardrail:
+        if not caps.has_guardrail and not caps.has_natives:
             return response
 
         handler_cls: Final = load_guardrail_translation_mappings().get(CallTypes.call_mcp_tool)
@@ -4693,20 +4715,34 @@ class ProxyLogging:
             verbose_proxy_logger.debug("MCP guardrail translation handler unavailable; skipping post_mcp_call hook")
             return response
 
-        for callback in caps.resolved_callbacks:
-            if not isinstance(callback, CustomGuardrail):
-                continue
-            if not routes_through_apply_guardrail(callback):
-                continue
-            if (
-                callback.should_run_guardrail(data=request_data, event_type=GuardrailEventHooks.post_mcp_call)
-                is not True
-            ):
-                continue
-            response = await self._run_guardrail_with_metrics(
+        run: Final = HookRun["CallToolResult"](response=response)
+        await run_hook_line(
+            hook_line(Hook.mcp_tool_result, caps.hook_callbacks),
+            hook_fields(request_data, run, Field.tool_result),
+            partial(self._post_mcp_call_one, run, handler_cls, request_data, user_api_key_dict),
+        )
+        return run.response
+
+    async def _post_mcp_call_one(
+        self,
+        run: HookRun["CallToolResult"],
+        handler_cls: type["BaseTranslation"],
+        request_data: Mapping[str, Any],
+        user_api_key_dict: UserAPIKeyAuth | None,
+        callback: object,
+        request: object,
+    ) -> None:
+        if not isinstance(callback, CustomGuardrail):
+            return
+        if not routes_through_apply_guardrail(callback):
+            return
+        if callback.should_run_guardrail(data=request_data, event_type=GuardrailEventHooks.post_mcp_call) is not True:
+            return
+        run.hold(
+            await self._run_guardrail_with_metrics(
                 callback,
                 handler_cls().process_output_response(
-                    response=response,
+                    response=run.response,
                     guardrail_to_apply=callback,
                     litellm_logging_obj=request_data.get("litellm_logging_obj"),
                     user_api_key_dict=user_api_key_dict,
@@ -4715,7 +4751,7 @@ class ProxyLogging:
                 "post_mcp_call",
                 request_data=request_data,
             )
-        return response
+        )
 
     async def post_call_response_headers_hook(
         self,
@@ -4731,94 +4767,91 @@ class ProxyLogging:
         Returns:
             Dict[str, str]: Merged headers from all callbacks.
         """
-        return await run_legacy_hook(
-            Hook.response_headers,
-            lambda _patches: self._legacy_response_headers(
-                data=data,
-                user_api_key_dict=user_api_key_dict,
-                response=response,
-                request_headers=request_headers,
-            ),
-        )
-
-    async def _legacy_response_headers(
-        self,
-        data: dict[str, object],  # mutable-ok: same request-payload shape as post_call_response_headers_hook's
-        user_api_key_dict: UserAPIKeyAuth,
-        response: object,
-        request_headers: dict[str, str] | None,  # mutable-ok: same shape as post_call_response_headers_hook's
-    ) -> dict[str, str]:  # mutable-ok: same merged-headers shape as post_call_response_headers_hook
-        merged_headers: Final[dict[str, str]] = {}
-        # Outer call sites in common_request_processing.py already gate this
-        # call with ``has_post_call_response_headers_callbacks()``. The
-        # cached detection makes the redundant interior guard cheap, but the
-        # guard would still iterate every code path through this function so
-        # keep it cheap and rely on the cached capability lookup.
-        if not ProxyLogging.callback_capabilities().has_post_call_response_headers:
+        merged_headers: Final[dict[str, str]] = {}  # mutable-ok: callbacks merge their headers into it
+        caps: Final = ProxyLogging.callback_capabilities()
+        if not caps.has_post_call_response_headers and not caps.has_natives:
             return merged_headers
 
         try:
-            # Build litellm_call_info — normalized routing metadata for callbacks
             litellm_call_info: Final = self._build_litellm_call_info(data=data, response=response)
-
-            for callback in litellm.callbacks:
-                _callback: CustomLogger | None = None
-                if isinstance(callback, str):
-                    _callback = litellm.litellm_core_utils.litellm_logging.get_custom_logger_compatible_class(
-                        cast(_custom_logger_compatible_callbacks_literal, callback)
-                    )
-                else:
-                    _callback = callback
-
-                if (
-                    _callback is not None
-                    and isinstance(_callback, CustomLogger)
-                    and _overrides_hook(_callback, "async_post_call_response_headers_hook")
-                ):
-                    if _accepts_litellm_call_info(_callback):
-                        result = await _callback.async_post_call_response_headers_hook(
-                            data=data,
-                            user_api_key_dict=user_api_key_dict,
-                            response=response,
-                            request_headers=request_headers,
-                            litellm_call_info=litellm_call_info,
-                        )
-                    else:
-                        # Backwards compat: callback doesn't accept litellm_call_info
-                        result = await _callback.async_post_call_response_headers_hook(
-                            data=data,
-                            user_api_key_dict=user_api_key_dict,
-                            response=response,
-                            request_headers=request_headers,
-                        )
-                    if result is not None:
-                        merged_headers.update(result)
+            await run_hook_line(
+                hook_line(Hook.response_headers, litellm.callbacks, admit=Admit.every_entry),
+                hook_fields(data, HookRun(response=merged_headers), Field.response_headers),
+                partial(
+                    self._response_headers_one,
+                    merged_headers,
+                    data,
+                    user_api_key_dict,
+                    response,
+                    request_headers,
+                    litellm_call_info,
+                ),
+            )
         except Exception as e:
             verbose_proxy_logger.exception("Error in post_call_response_headers_hook: %s", str(e))
         return merged_headers
 
+    async def _response_headers_one(
+        self,
+        merged_headers: dict[str, str],  # mutable-ok: the merged headers this hook returns
+        data: dict[str, object],  # mutable-ok: same request-payload shape as post_call_response_headers_hook's
+        user_api_key_dict: UserAPIKeyAuth,
+        response: object,
+        request_headers: dict[str, str] | None,  # mutable-ok: same shape as post_call_response_headers_hook's
+        litellm_call_info: dict[str, object],  # mutable-ok: same shape as _build_litellm_call_info's
+        callback: object,
+        request: object,
+    ) -> None:
+        resolved: Final = _resolved_logger(callback)
+        if resolved is None or not _overrides_hook(resolved, "async_post_call_response_headers_hook"):
+            return
+        result: Final = (
+            await resolved.async_post_call_response_headers_hook(
+                data=data,
+                user_api_key_dict=user_api_key_dict,
+                response=response,
+                request_headers=request_headers,
+                litellm_call_info=litellm_call_info,
+            )
+            if _accepts_litellm_call_info(resolved)
+            else await resolved.async_post_call_response_headers_hook(
+                data=data,
+                user_api_key_dict=user_api_key_dict,
+                response=response,
+                request_headers=request_headers,
+            )
+        )
+        if result is not None:
+            merged_headers.update(result)
+
     async def hidden_by_listing_callbacks(
         self, user_api_key_dict: UserAPIKeyAuth, model_names: Sequence[str]
     ) -> frozenset[str]:
-        return await run_legacy_hook(
-            Hook.list_models,
-            lambda _patches: self._legacy_hidden_by_listing_callbacks(
-                user_api_key_dict=user_api_key_dict,
-                model_names=model_names,
-            ),
-        )
-
-    async def _legacy_hidden_by_listing_callbacks(
-        self, user_api_key_dict: UserAPIKeyAuth, model_names: Sequence[str]
-    ) -> frozenset[str]:
-        filters: Final = ProxyLogging.callback_capabilities().listed_models_filters
-        if not filters:
+        caps: Final = ProxyLogging.callback_capabilities()
+        if not caps.listed_models_filters and not caps.has_natives:
             return frozenset()
         candidates: Final = tuple(model_names)
-        kept: Final = await _names_kept_by_listing_callbacks(filters, user_api_key_dict, candidates)
-        if isinstance(kept, MalformedListingFilterReturn):
-            _raise_malformed_listing_filter_return(kept)
-        return frozenset(candidates).difference(kept)
+        run: Final = HookRun[tuple[str, ...]](response=candidates)
+        await run_hook_line(
+            hook_line(Hook.list_models, caps.hook_callbacks),
+            HookRunFields(KwargsFields(_NO_KWARGS, _NO_KEYS), run, Field.model_list),
+            partial(self._filter_listed_models, run, user_api_key_dict),
+        )
+        return frozenset(candidates).difference(run.response)
+
+    @staticmethod
+    async def _filter_listed_models(
+        run: HookRun[tuple[str, ...]], user_api_key_dict: UserAPIKeyAuth, callback: object, request: object
+    ) -> None:
+        names: Final = run.response
+        if not names or not isinstance(callback, CustomLogger):
+            return
+        returned: Final = await callback.async_filter_listed_models(user_api_key_dict, names)
+        try:
+            kept: Final = frozenset(_LISTED_MODEL_NAMES.validate_python(returned))
+        except ValidationError:
+            _raise_malformed_listing_filter_return(MalformedListingFilterReturn(callback=type(callback).__name__))
+        run.hold(tuple(name for name in names if name in kept))
 
     @staticmethod
     def _build_litellm_call_info(data: dict, response: object) -> dict[str, object]:
