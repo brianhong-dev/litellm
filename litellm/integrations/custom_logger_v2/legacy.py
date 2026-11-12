@@ -278,10 +278,16 @@ def _native_entry(native: CustomLoggerV2, hook: Hook) -> tuple[CallbackManifest,
     return None if subscription is None else (manifest, subscription)
 
 
-def _legacy_entry(inner: CustomLogger, hook: Hook, admit: Admit) -> tuple[CallbackManifest, Subscription] | None:
+def _legacy_entry(
+    inner: CustomLogger, hook: Hook, admit: Admit, parallel: bool
+) -> tuple[CallbackManifest, Subscription] | None:
     adapter: Final = adapter_for(inner)
     subscription: Final = adapter.subscription(hook, admit)
-    return None if subscription is None else (adapter.manifest, subscription)
+    if subscription is None:
+        return None
+    if subscription.parallel and not parallel:
+        return adapter.manifest, legacy_subscription(hook, False)
+    return adapter.manifest, subscription
 
 
 def _opaque_entry(item: object, hook: Hook) -> tuple[CallbackManifest, Subscription] | None:
@@ -291,17 +297,19 @@ def _opaque_entry(item: object, hook: Hook) -> tuple[CallbackManifest, Subscript
     return opaque.manifest, opaque.manifest.subscriptions[hook]
 
 
-def _line_member(item: object, hook: Hook, admit: Admit, natives: bool) -> tuple[CallbackManifest, Subscription] | None:
+def _line_member(
+    item: object, hook: Hook, admit: Admit, natives: bool, parallel: bool
+) -> tuple[CallbackManifest, Subscription] | None:
     if isinstance(item, CustomLoggerV2):
         return _native_entry(item, hook) if natives else None
     if isinstance(item, CustomLogger):
-        return _legacy_entry(item, hook, admit)
+        return _legacy_entry(item, hook, admit, parallel)
     return _opaque_entry(item, hook) if admit is Admit.every_entry else None
 
 
-def _build_line(hook: Hook, callbacks: Sequence[object], admit: Admit, natives: bool) -> HookLine:
+def _build_line(hook: Hook, callbacks: Sequence[object], admit: Admit, natives: bool, parallel: bool) -> HookLine:
     members: Final = tuple(
-        member for item in callbacks if (member := _line_member(item, hook, admit, natives)) is not None
+        member for item in callbacks if (member := _line_member(item, hook, admit, natives, parallel)) is not None
     )
     entries: Final = tuple(
         Entry(position, manifest, subscription) for position, (manifest, subscription) in enumerate(members)
@@ -342,13 +350,18 @@ def _cache_line(key: tuple[object, ...], line: HookLine, callbacks: Sequence[obj
 
 
 def hook_line(
-    hook: Hook, callbacks: Sequence[object], *, admit: Admit = Admit.overriders, natives: bool = True
+    hook: Hook,
+    callbacks: Sequence[object],
+    *,
+    admit: Admit = Admit.overriders,
+    natives: bool = True,
+    parallel: bool = True,
 ) -> HookLine:
-    key: Final = (hook, admit, natives, *map(id, callbacks))
+    key: Final = (hook, admit, natives, parallel, *map(id, callbacks))
     cached: Final = _LINES.get(key)
     if cached is not None:
         return cached.line
-    line: Final = _build_line(hook, callbacks, admit, natives)
+    line: Final = _build_line(hook, callbacks, admit, natives, parallel)
     _cache_line(key, line, callbacks)
     return line
 

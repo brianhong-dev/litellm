@@ -7,7 +7,7 @@ import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from functools import lru_cache
+from functools import lru_cache, partial
 from http import HTTPStatus
 from itertools import chain
 from types import MappingProxyType
@@ -56,8 +56,8 @@ from litellm.constants import (
 )
 from litellm.integrations.custom_guardrail import CustomGuardrail, ModifyResponseException
 from litellm.integrations.custom_logger import overrides_hook
-from litellm.integrations.custom_logger_v2.enums import Hook
-from litellm.integrations.custom_logger_v2.host import run_legacy_hook
+from litellm.integrations.custom_logger_v2.enums import Field, Hook
+from litellm.integrations.custom_logger_v2.legacy import hook_line
 from litellm.integrations.otel.runtime import phase_event
 from litellm.litellm_core_utils.add_retry_fallback_headers import get_hidden_params_dict
 from litellm.litellm_core_utils.agentic_followup_failure import is_agentic_followup_failure
@@ -158,10 +158,13 @@ from litellm.proxy.route_llm_request import (
 from litellm.proxy.spend_tracking.cost_finalization import finalize_proxy_response_cost, prepare_response_cost
 from litellm.proxy.telemetry.request_context import bind_call_id as bind_telemetry_call_id
 from litellm.proxy.utils import (  # noqa: F401  # legacy module exports
+    HookRun,
     ProxyLogging,
     _check_and_merge_model_level_guardrails,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
     check_and_merge_model_level_guardrails,
+    hook_fields,
     routes_through_apply_guardrail,
+    run_hook_line,
 )
 from litellm.responses.mcp.parked_stream_dispatch import in_flight_round_biller, parked_success
 from litellm.responses.streaming_iterator import partial_responses_incomplete_event_on_disconnect, spawn_logging_task
@@ -323,6 +326,7 @@ from litellm.proxy.litellm_pre_call_utils import (
 from litellm.proxy.policy_engine.response_retrieval import attach_post_call_pipelines_to_retrieval
 from litellm.types.litellm_params import STREAM_USAGE_INJECTED_FIELD
 from litellm.types.utils import (
+    LLMResponseTypes,
     ModelResponse,
     ModelResponseStream,
     StandardLoggingPayloadErrorInformation,
@@ -4502,26 +4506,7 @@ class ProxyBaseLLMRequestProcessing:
         Extracted as a static method so tests can call the production
         implementation directly rather than reimplementing the closure.
         """
-        await run_legacy_hook(
-            Hook.post_call_success,
-            lambda _patches: ProxyBaseLLMRequestProcessing._legacy_deferred_stream_guardrails(
-                captured_data=captured_data,
-                captured_user_api_key_dict=captured_user_api_key_dict,
-                captured_logging_obj=captured_logging_obj,
-                assembled_response=assembled_response,
-                cache_hit=cache_hit,
-            ),
-        )
-
-    @staticmethod
-    async def _legacy_deferred_stream_guardrails(
-        captured_data: dict[str, object],  # mutable-ok: same request-payload shape as the captured request dict
-        captured_user_api_key_dict: "UserAPIKeyAuth",
-        captured_logging_obj: LiteLLMLoggingObj,
-        assembled_response: Any,  # noqa: ANN401  # same untyped assembled stream response the public method takes
-        cache_hit: object,
-    ) -> None:
-        _response = assembled_response
+        run: Final[HookRun[LLMResponseTypes]] = HookRun(response=assembled_response)
         try:
             from litellm.proxy.proxy_server import llm_router as _global_llm_router
             from litellm.proxy.utils import (
@@ -4533,47 +4518,18 @@ class ProxyBaseLLMRequestProcessing:
                 data=captured_data, llm_router=_global_llm_router
             )
             stream_gated: Final = stream_gated_guardrail_names(captured_data, captured_user_api_key_dict)
-            for cb in litellm.callbacks:
-                if not isinstance(cb, CustomGuardrail):
-                    continue
-                if cb.guardrail_name in stream_gated:
-                    continue
-                if not cb.should_run_guardrail(
-                    data=guardrail_data,
-                    event_type=GuardrailEventHooks.post_call,
-                ):
-                    continue
-                try:
-                    guardrail_result = None
-                    if routes_through_apply_guardrail(cb):
-                        # Skip — unified-routed guardrails already ran via
-                        # unified_guardrail's end-of-stream block in the
-                        # streaming iterator pipeline.  Running them again
-                        # here would duplicate the guardrail API call
-                        # (e.g. double OpenAI Moderation charges).
-                        continue
-                    if overrides_hook(type(cb), "async_post_call_streaming_iterator_hook"):
-                        # Skip — the guardrail already scanned the assembled
-                        # response via its own streaming iterator hook in the
-                        # streaming pipeline. re running this function async_post_call_success_hook
-                        # here would duplicate the scan and can spuriously block the guardrail that already passed / failed.
-                        continue
-                    else:
-                        guardrail_result = await cb.async_post_call_success_hook(
-                            user_api_key_dict=captured_user_api_key_dict,
-                            data=guardrail_data,
-                            response=_response,
-                        )
-                    if guardrail_result is not None:
-                        _response = guardrail_result
-                except Exception as e:
-                    verbose_proxy_logger.exception(
-                        "Error running post-call guardrail %s on streaming response: %s",
-                        getattr(cb, "guardrail_name", type(cb).__name__),
-                        e,
-                    )
-                    if isinstance(e, HTTPException) and hasattr(captured_logging_obj, "model_call_details"):
-                        captured_logging_obj.model_call_details.setdefault("metadata", {})["guardrail_blocked"] = True
+            await run_hook_line(
+                hook_line(Hook.post_call_success, litellm.callbacks, parallel=False),
+                hook_fields(guardrail_data, run, Field.response),
+                partial(
+                    ProxyBaseLLMRequestProcessing._deferred_stream_guardrail,
+                    run,
+                    guardrail_data,
+                    stream_gated,
+                    captured_user_api_key_dict,
+                    captured_logging_obj,
+                ),
+            )
         except Exception as e:
             verbose_proxy_logger.exception(
                 "Error in deferred streaming guardrail initialization: %s",
@@ -4588,7 +4544,7 @@ class ProxyBaseLLMRequestProcessing:
                 # async markers stored in litellm_params).
                 asyncio.create_task(
                     _as_success_dispatcher(captured_logging_obj).dispatch_success_handlers(
-                        _response,
+                        run.response,
                         cache_hit=cache_hit,
                         start_time=None,
                         end_time=None,
@@ -4600,6 +4556,55 @@ class ProxyBaseLLMRequestProcessing:
                     "Error in deferred streaming success logging: %s",
                     e,
                 )
+
+    @staticmethod
+    async def _deferred_stream_guardrail(
+        run: HookRun[LLMResponseTypes],
+        guardrail_data: dict[str, object],  # mutable-ok: the captured request merged with model-level guardrails
+        stream_gated: frozenset[str],
+        captured_user_api_key_dict: "UserAPIKeyAuth",
+        captured_logging_obj: LiteLLMLoggingObj,
+        cb: object,
+        request: object,
+    ) -> None:
+        if not isinstance(cb, CustomGuardrail):
+            return
+        if cb.guardrail_name in stream_gated:
+            return
+        if not cb.should_run_guardrail(
+            data=guardrail_data,
+            event_type=GuardrailEventHooks.post_call,
+        ):
+            return
+        try:
+            if routes_through_apply_guardrail(cb):
+                # Skip — unified-routed guardrails already ran via
+                # unified_guardrail's end-of-stream block in the
+                # streaming iterator pipeline.  Running them again
+                # here would duplicate the guardrail API call
+                # (e.g. double OpenAI Moderation charges).
+                return
+            if overrides_hook(type(cb), "async_post_call_streaming_iterator_hook"):
+                # Skip — the guardrail already scanned the assembled
+                # response via its own streaming iterator hook in the
+                # streaming pipeline. re running this function async_post_call_success_hook
+                # here would duplicate the scan and can spuriously block the guardrail that already passed / failed.
+                return
+            run.adopt(
+                await cb.async_post_call_success_hook(
+                    user_api_key_dict=captured_user_api_key_dict,
+                    data=guardrail_data,
+                    response=run.response,
+                )
+            )
+        except Exception as e:
+            verbose_proxy_logger.exception(
+                "Error running post-call guardrail %s on streaming response: %s",
+                getattr(cb, "guardrail_name", type(cb).__name__),
+                e,
+            )
+            if isinstance(e, HTTPException) and hasattr(captured_logging_obj, "model_call_details"):
+                captured_logging_obj.model_call_details.setdefault("metadata", {})["guardrail_blocked"] = True
 
     def _apply_router_cooldown_retry_after(self, headers: dict, e: Exception) -> None:
         if isinstance(e, RouterRateLimitError) and e.cooldown_time > 0:
