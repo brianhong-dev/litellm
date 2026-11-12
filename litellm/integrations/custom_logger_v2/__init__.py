@@ -1,5 +1,5 @@
 from litellm.integrations.custom_logger_v2.call import CallContext, CallFacts, CallIds, CallKind, CallTarget, CallTiming
-from litellm.integrations.custom_logger_v2.dispatcher import Dispatcher, HookResult, LegacyGroup, RequestScope
+from litellm.integrations.custom_logger_v2.dispatcher import Dispatcher, HookResult, RequestScope
 from litellm.integrations.custom_logger_v2.enforcement import ContractViolation, UndeclaredReadError
 from litellm.integrations.custom_logger_v2.enums import Activation, Field, FieldTier, Hook, OptOutBy
 from litellm.integrations.custom_logger_v2.hooks import (
@@ -52,7 +52,6 @@ __all__ = [
     "InvalidDeclarationError",
     "InvalidPatchError",
     "JsonValue",
-    "LegacyGroup",
     "MergeField",
     "OffPathSink",
     "OptOutBy",

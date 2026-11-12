@@ -95,43 +95,13 @@ MESSAGES = (MappingProxyType({"role": "user", "content": "my card is 4111"}),)
 FIELDS: Mapping[Field, object] = MappingProxyType({F.messages: MESSAGES, F.metadata: MappingProxyType({"a": 1})})
 
 
-async def test_zero_natives_run_only_the_legacy_group_and_return_its_value() -> None:
-    value = object()
-    received: list[tuple[Patch, ...]] = []
-
-    async def legacy(patches: tuple[Patch, ...]) -> object:
-        received.append(patches)
-        return value
-
-    result = await dispatcher().open_scope(RequestSelection()).run_hook(Hook.pre_call, FIELDS, None, legacy)
-
-    assert result.legacy is value
-    assert result.fields is FIELDS
-    assert result.outcome is None
-    assert received == [()]
-
-
-async def test_zero_natives_propagate_the_legacy_group_exception_unchanged() -> None:
-    error = RuntimeError("guardrail said no")
-
-    async def legacy(patches: tuple[Patch, ...]) -> object:
-        raise error
-
-    with pytest.raises(RuntimeError) as raised:
-        await dispatcher().open_scope(RequestSelection()).run_hook(Hook.pre_call, FIELDS, None, legacy)
-
-    assert raised.value is error
-
-
 async def test_natives_on_other_hooks_leave_this_hook_a_passthrough() -> None:
     elsewhere = native("elsewhere", Hook.post_call_success, returning(Patch()), writes={F.response})
 
-    async def legacy(patches: tuple[Patch, ...]) -> str:
-        return "legacy"
+    result = await dispatcher(elsewhere).open_scope(RequestSelection()).run_hook(Hook.pre_call, FIELDS, None)
 
-    result = await dispatcher(elsewhere).open_scope(RequestSelection()).run_hook(Hook.pre_call, FIELDS, None, legacy)
-
-    assert result.legacy == "legacy"
+    assert result.fields is FIELDS
+    assert result.outcome is None
     assert result.patches == ()
 
 
@@ -213,33 +183,11 @@ async def test_a_later_writer_never_shows_an_earlier_reader_its_patch() -> None:
     assert result.fields[F.messages] == ()
 
 
-async def test_natives_run_before_the_legacy_group_which_receives_their_patches() -> None:
-    patch = Patch().set(F.messages, ())
-    received: list[tuple[Patch, ...]] = []
-
-    async def legacy(patches: tuple[Patch, ...]) -> str:
-        received.append(patches)
-        return "done"
-
-    scope = dispatcher(native("masker", behaviour=returning(patch), writes={F.messages})).open_scope(RequestSelection())
-
-    result = await scope.run_hook(Hook.pre_call, FIELDS, None, legacy)
-
-    assert received == [(patch,)]
-    assert result.legacy == "done"
-    assert result.patches == (patch,)
-
-
 @pytest.mark.parametrize("outcome", [Abort(status=400, message="blocked"), Respond(response={"ok": True})])
-async def test_terminal_outcome_stops_new_starts_discards_in_flight_patches_and_skips_legacy(
+async def test_terminal_outcome_stops_new_starts_and_discards_in_flight_patches(
     outcome: Abort | Respond,
 ) -> None:
     journal: list[str] = []
-    legacy_calls = Calls()
-
-    async def legacy(patches: tuple[Patch, ...]) -> None:
-        legacy_calls.calls += 1
-
     scope = dispatcher(
         native("guard", behaviour=returning(outcome, journal, "guard"), reads={F.messages}, may_abort=True),
         native(
@@ -248,12 +196,11 @@ async def test_terminal_outcome_stops_new_starts_discards_in_flight_patches_and_
         native("later", behaviour=returning(None, journal, "later"), may_abort=True),
     ).open_scope(RequestSelection())
 
-    result = await scope.run_hook(Hook.pre_call, FIELDS, None, legacy)
+    result = await scope.run_hook(Hook.pre_call, FIELDS, None)
 
     assert result.outcome is outcome
     assert result.patches == ()
     assert journal == ["guard+", "tagger+", "guard-", "tagger-"]
-    assert legacy_calls.calls == 0
 
 
 async def test_patches_from_finished_stages_survive_a_later_abort() -> None:
@@ -270,12 +217,8 @@ async def test_patches_from_finished_stages_survive_a_later_abort() -> None:
     assert result.patches == (patch,)
 
 
-async def test_reroute_is_recorded_and_the_rest_of_the_list_and_legacy_still_run() -> None:
+async def test_reroute_is_recorded_and_the_rest_of_the_list_still_runs() -> None:
     journal: list[str] = []
-
-    async def legacy(patches: tuple[Patch, ...]) -> str:
-        journal.append("legacy")
-        return "ran"
 
     scope = dispatcher(
         native("router", behaviour=returning(Reroute(model="safe-model")), may_abort=True),
@@ -283,12 +226,11 @@ async def test_reroute_is_recorded_and_the_rest_of_the_list_and_legacy_still_run
         native("scanner", behaviour=returning(None, journal, "scanner"), may_abort=True),
     ).open_scope(RequestSelection())
 
-    result = await scope.run_hook(Hook.pre_call, FIELDS, None, legacy)
+    result = await scope.run_hook(Hook.pre_call, FIELDS, None)
 
     assert result.outcome == Reroute(model="safe-model")
     assert scope.reroute == Reroute(model="safe-model")
-    assert result.legacy == "ran"
-    assert journal == ["scanner+", "scanner-", "legacy"]
+    assert journal == ["scanner+", "scanner-"]
 
 
 async def test_a_later_abort_beats_an_earlier_reroute() -> None:
@@ -306,21 +248,24 @@ async def test_a_later_abort_beats_an_earlier_reroute() -> None:
 
 async def test_unexpected_exception_from_a_blocking_native_fails_the_request_closed() -> None:
     error = ValueError("vendor down")
-    legacy_calls = Calls()
+    later = Calls()
 
     async def broken(view: object, ctx: CallContext[object]) -> None:
         raise error
 
-    async def legacy(patches: tuple[Patch, ...]) -> None:
-        legacy_calls.calls += 1
+    async def counted(view: object, ctx: CallContext[object]) -> None:
+        later.calls += 1
 
-    scope = dispatcher(native("guard", behaviour=broken, may_abort=True)).open_scope(RequestSelection())
+    scope = dispatcher(
+        native("guard", behaviour=broken, may_abort=True),
+        native("later", behaviour=counted, may_abort=True),
+    ).open_scope(RequestSelection())
 
     with pytest.raises(ValueError, match="vendor down") as raised:
-        await scope.run_hook(Hook.pre_call, FIELDS, None, legacy)
+        await scope.run_hook(Hook.pre_call, FIELDS, None)
 
     assert raised.value is error
-    assert legacy_calls.calls == 0
+    assert later.calls == 0
 
 
 async def test_swallowing_hooks_count_the_failure_and_keep_the_other_patches() -> None:
@@ -347,20 +292,16 @@ async def test_awaited_readers_run_after_blocking_work_in_parallel_and_never_fai
         await asyncio.sleep(0)
         raise RuntimeError("redis down")
 
-    async def legacy(patches: tuple[Patch, ...]) -> str:
-        journal.append("legacy")
-        return "ok"
-
     owner = dispatcher(
         native("release", behaviour=returning(None, journal, "release"), reads={F.key_identity}, awaited=True),
         native("failing", behaviour=failing, awaited=True),
         native("writer", behaviour=returning(Patch().set(F.messages, ()), journal, "writer"), writes={F.messages}),
     )
 
-    result = await owner.open_scope(RequestSelection()).run_hook(Hook.pre_call, FIELDS, None, legacy)
+    result = await owner.open_scope(RequestSelection()).run_hook(Hook.pre_call, FIELDS, None)
 
-    assert journal == ["writer+", "writer-", "legacy", "release+", "failing+", "release-"]
-    assert result.legacy == "ok"
+    assert journal == ["writer+", "writer-", "release+", "failing+", "release-"]
+    assert result.fields[F.messages] == ()
     assert owner.failures[("failing", Hook.pre_call)] == 1
 
 

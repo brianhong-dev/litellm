@@ -378,7 +378,7 @@ async def run_line(
     between: Between | None = None,
     call: CallFacts | None = None,
     scope: RequestScope | None = None,
-) -> HookResult[None]:
+) -> HookResult:
     if not line.has_natives:
         return HookResult(fields=await run_legacy_plan(line.hook, line.plan, fields, binding, between))
     bound: Final = scope or current_scope()
@@ -405,7 +405,7 @@ def run_line_sync(
         return transient.run_plan_sync(line.hook, line.plan_for(transient), fields, call, binding)
 
 
-def kwargs_after(result: HookResult[None]) -> object:
+def kwargs_after(result: HookResult) -> object:
     match result.outcome:
         case Abort() | Respond() as terminal:
             raise NativeOutcome(terminal, result.patches)

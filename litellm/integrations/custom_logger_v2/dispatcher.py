@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from itertools import chain
 from operator import itemgetter
 from types import TracebackType
-from typing import Final, Generic, Protocol, TypeAlias, TypeVar
+from typing import Final, Protocol, TypeAlias, TypeVar
 
 from typing_extensions import Self
 
@@ -25,7 +25,6 @@ from litellm.integrations.custom_logger_v2.selection import RequestSelection, is
 
 LegacyT: Final = TypeVar("LegacyT")
 
-LegacyGroup: TypeAlias = Callable[[tuple[Patch, ...]], Awaitable[LegacyT]]
 Between: TypeAlias = Callable[[Mapping[Field, object]], Awaitable[Mapping[Field, object]]]
 SyncBinding: TypeAlias = Callable[[object, object], object]
 
@@ -39,11 +38,10 @@ class _Handler(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
-class HookResult(Generic[LegacyT]):
+class HookResult:
     fields: Mapping[Field, object]
     patches: tuple[Patch, ...] = ()
     outcome: Outcome | None = None
-    legacy: LegacyT | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,22 +221,20 @@ class RequestScope:
         hook: Hook,
         fields: Mapping[Field, object],
         call: CallFacts | None,
-        legacy: LegacyGroup[LegacyT] | None = None,
-    ) -> HookResult[LegacyT]:
+    ) -> HookResult:
         plan: Final = self.plan(hook)
         if plan is EMPTY_PLAN:
-            return HookResult(fields=fields, legacy=None if legacy is None else await legacy(()))
+            return HookResult(fields=fields)
         chain: Final = await self._run_stages(hook, plan.stages, _Chain(fields=fields), call, None)
         patches: Final = chain.ordered_patches
         if chain.terminal is not None:
             return HookResult(fields=chain.fields, patches=patches, outcome=chain.terminal)
-        legacy_result: Final = None if legacy is None else await legacy(patches)
         await self._run_awaited(hook, plan.awaited, chain.fields, call)
         if plan.off_path:
             self._dispatcher.sink.submit(self._deliver_off_path(hook, plan.off_path, chain.fields, call))
         if chain.reroute is not None:
             self.reroute = chain.reroute
-        return HookResult(fields=chain.fields, patches=patches, outcome=chain.reroute, legacy=legacy_result)
+        return HookResult(fields=chain.fields, patches=patches, outcome=chain.reroute)
 
     async def run_plan(
         self,
@@ -248,7 +244,7 @@ class RequestScope:
         call: CallFacts | None,
         binding: LegacyBinding,
         between: Between | None = None,
-    ) -> HookResult[None]:
+    ) -> HookResult:
         serial, parallel = _split(plan.stages)
         chain: Final = await self._run_stages(hook, serial, _Chain(fields=fields), call, binding)
         if chain.terminal is not None:
@@ -284,21 +280,6 @@ class RequestScope:
         result: Final = run_legacy_plan_sync(plan, fields, binding)
         if plan.off_path:
             self._dispatcher.sink.submit(self._deliver_off_path(hook, plan.off_path, result, call))
-        return result
-
-    def run_sync_hook(
-        self,
-        hook: Hook,
-        fields: Mapping[Field, object],
-        call: CallFacts | None,
-        legacy: Callable[[tuple[Patch, ...]], LegacyT],
-    ) -> LegacyT:
-        plan: Final = self.plan(hook)
-        if plan.stages or plan.awaited:
-            raise ContractViolation(f"{hook.value} runs synchronously here, so only off-path natives may subscribe")
-        result: Final = legacy(())
-        if plan.off_path:
-            self._dispatcher.sink.submit(self._deliver_off_path(hook, plan.off_path, fields, call))
         return result
 
     def _state(self, entry: Entry) -> object:
