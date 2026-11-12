@@ -173,8 +173,17 @@ def modify_max_tokens(
         cache.remember_unclamped(kwargs.get("litellm_logging_obj"), unclamped)
 
 
+def _anthropic_metadata(params: Mapping[str, object]) -> Mapping[str, object]:
+    metadata: Final = params.get("metadata")
+    if not isinstance(metadata, Mapping):
+        return params
+    return {**params, "metadata": {key: value for key, value in metadata.items() if key == "user_id"}}
+
+
 def _body_fields(request: Mapping[str, object]) -> Mapping[str, object]:
-    params: Final = known_params(_BODY_FIELDS.difference(handler.additional_drop_paths(request)), request)
+    params: Final = _anthropic_metadata(
+        known_params(_BODY_FIELDS.difference(handler.additional_drop_paths(request)), request)
+    )
     if deployment_reasoning_effort_levels(request.get("model_info")) is None:
         return params
     return _with_deployment_effort(params, request)
